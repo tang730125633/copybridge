@@ -5,6 +5,7 @@ using System.Security.AccessControl;
 using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
 using System.Security.Principal;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
 using System.Windows;
@@ -33,36 +34,62 @@ static class Program {
     internal static Identity Identity=null!;
     static string data="";
     static string bindAddress="127.0.0.1";
+    static int listenPort=43861;
+    static X509Certificate2 activeCertificate=null!;
+    static SettingsWindow? settingsWindow;
+    static string invitationCode="";
+    static long lastPeerSeenTicks;
+    internal static bool PeerRecentlySeen=>Interlocked.Read(ref lastPeerSeenTicks)>DateTime.UtcNow.AddSeconds(-5).Ticks;
+    internal static string Origin=>$"https://{bindAddress}:{listenPort}";
+    internal static bool InvitationAvailable=>Identity.Token==null&&invitationCode!=""&&Identity.Expires>DateTimeOffset.UtcNow;
+    static string InvitationPath=>Path.Combine(data,"latest-invitation.copybridge");
     static Bridge bridge=null!;
     static Forms.NotifyIcon tray=null!;
     static WebApplication web=null!;
     static int pairAttempts; static DateTimeOffset pairWindow=DateTimeOffset.UtcNow;
-    static readonly SemaphoreSlim pairLock=new(1,1);
     static bool AtCheckpoint(ref long next,long count){if(count<next)return false;next=count+4*1024*1024;return true;}
+    [DllImport("user32.dll")] static extern bool AllowSetForegroundWindow(uint processId);
+    static string InstanceKey(string directory)=>Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(Path.GetFullPath(directory).TrimEnd(Path.DirectorySeparatorChar).ToUpperInvariant())))[..20];
+    static void NotifyExisting(EventWaitHandle signal,string directory) {
+        try {
+            using var runtime=JsonDocument.Parse(File.ReadAllText(Path.Combine(directory,"runtime.json")));
+            if(runtime.RootElement.TryGetProperty("pid",out var value)&&value.TryGetInt32(out int pid)) {
+                using var process=Process.GetProcessById(pid);
+                if(string.Equals(process.MainModule?.FileName,Environment.ProcessPath,StringComparison.OrdinalIgnoreCase))AllowSetForegroundWindow((uint)pid);
+            }
+        }catch(Exception){/* Foreground permission is best-effort; the window is still shown by the event. */}
+        signal.Set();
+    }
     static readonly object metricsGate=new();
     static void Metric(object record){try{lock(metricsGate)File.AppendAllText(Path.Combine(data,"transfer-performance.jsonl"),JsonSerializer.Serialize(record,Bridge.Json)+"\n");}catch(IOException){}}
     [STAThread] public static int Main(string[] args) {
         if(args.Contains("--self-test")) {try {SelfTest(); return 0;} catch(Exception e){File.WriteAllText("self-test-failure.txt",e.ToString());return 1;}}
         string Option(string key,string fallback){int i=Array.IndexOf(args,key);return i>=0&&i+1<args.Length?args[i+1]:fallback;}
         if(args.Contains("--fixture-command"))return Fixture.Run(Option("--fixture-command",""));
-        bindAddress=Option("--bind","127.0.0.1");
-        data=Option("--data",Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),"CopyBridge"));
+        data=Path.GetFullPath(Option("--data",Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),"CopyBridge")));
+        string instanceKey=InstanceKey(data);
+        using var showSettings=new EventWaitHandle(false,EventResetMode.AutoReset,"Local\\CopyBridge-settings-"+instanceKey);
+        using var single=new Mutex(true,"Local\\CopyBridge-"+instanceKey,out bool created);
+        if(!created){if(args.Contains("--bootstrap"))return 2;NotifyExisting(showSettings,data);return 0;}
+        if(args.Contains("--notify-existing"))return 2; // Safe secondary-launch self-test: never create a watcher.
         Directory.CreateDirectory(data);Restrict(data);
         try {
-            Identity=LoadIdentity(); var cert=Certificate();
+            bindAddress=PairingInvite.ChooseAddress(args.Contains("--bind")?Option("--bind",""):null,data);listenPort=int.Parse(Option("--port","43861"));if(listenPort<1||listenPort>65535)throw new Fault("INVALID_PORT",400);
+            Identity=LoadIdentity();var cert=Certificate();activeCertificate=cert;
             File.WriteAllText(Path.Combine(data,"certificate.pem"),cert.ExportCertificatePem());
             if(Identity.Token==null){Identity.Bootstrap=Convert.ToHexString(RandomNumberGenerator.GetBytes(32)).ToLowerInvariant();Identity.Expires=DateTimeOffset.UtcNow.AddMinutes(10); SaveIdentity();WritePairing(cert);}
             File.WriteAllText(Path.Combine(data,"fingerprint.json"),JsonSerializer.Serialize(new{deviceId=Identity.DeviceId,certificateSha256=Convert.ToHexString(SHA256.HashData(cert.RawData)).ToLowerInvariant()},Bridge.Json));
             if(args.Contains("--bootstrap"))return 0;
-            using var single=new Mutex(true,"Local\\CopyBridge",out bool created);if(!created)return 2;
             var application=new System.Windows.Application {ShutdownMode=ShutdownMode.OnExplicitShutdown};
             using var owner=new HwndSource(new HwndSourceParameters("CopyBridgeClipboardOwner"){Width=0,Height=0,WindowStyle=0});NativeClipboard.Owner=owner.Handle;
             bridge=new(Dispatcher.CurrentDispatcher,data);BuildTray(application);bridge.Notify(Identity.Token==null?"等待配对":"等待 Mac 连接，请重新复制");
-            string bind=Option("--bind","127.0.0.1");int port=int.Parse(Option("--port","43861"));
+            var launchWait=ThreadPool.RegisterWaitForSingleObject(showSettings,(_,_)=>{if(!application.Dispatcher.HasShutdownStarted)application.Dispatcher.BeginInvoke(new Action(OpenSettings));},null,Timeout.Infinite,false);
+            string bind=bindAddress;int port=listenPort;
             web=Server(bind,port,cert); _=web.StartAsync().ContinueWith(t=> {if(t.IsFaulted)bridge.UI.Invoke(()=>bridge.Notify("监听失败：请检查端口"));});
             var timer=new DispatcherTimer {Interval=TimeSpan.FromMilliseconds(100)};timer.Tick+=(_,_)=>bridge.Observe();timer.Start();
-            application.Exit+=(_,_)=>{timer.Stop();tray.Dispose();web.StopAsync().GetAwaiter().GetResult();};
+            application.Exit+=(_,_)=>{launchWait.Unregister(null);timer.Stop();tray.Dispose();web.StopAsync().GetAwaiter().GetResult();};
             File.WriteAllText(Path.Combine(data,"runtime.json"),JsonSerializer.Serialize(new {pid=Environment.ProcessId,sessionId=System.Diagnostics.Process.GetCurrentProcess().SessionId,bind,port,startedAt=DateTimeOffset.UtcNow},Bridge.Json));
+            if(Identity.Token==null||args.Contains("--settings"))OpenSettings();
             application.Run();return 0;
         } catch(Exception e) {File.WriteAllText(Path.Combine(data,"startup-error.txt"),e.GetType().Name+": "+e.Message);return 1;}
     }
@@ -74,8 +101,8 @@ static class Program {
     static Identity LoadIdentity() {
         string path=Path.Combine(data,"identity.dpapi");return File.Exists(path)?JsonSerializer.Deserialize<Identity>(ProtectedData.Unprotect(File.ReadAllBytes(path),null,DataProtectionScope.CurrentUser),Bridge.Json)!:new();
     }
-    static void SaveIdentity() {
-        string path=Path.Combine(data,"identity.dpapi");File.WriteAllBytes(path+".new",ProtectedData.Protect(JsonSerializer.SerializeToUtf8Bytes(Identity,Bridge.Json),null,DataProtectionScope.CurrentUser));File.Move(path+".new",path,true);
+    static void SaveIdentity(Identity? replacement=null) {
+        string path=Path.Combine(data,"identity.dpapi");File.WriteAllBytes(path+".new",ProtectedData.Protect(JsonSerializer.SerializeToUtf8Bytes(replacement??Identity,Bridge.Json),null,DataProtectionScope.CurrentUser));File.Move(path+".new",path,true);
     }
     static X509Certificate2 Certificate() {
         string path=Path.Combine(data,"certificate.dpapi");if(File.Exists(path))return X509CertificateLoader.LoadPkcs12(ProtectedData.Unprotect(File.ReadAllBytes(path),null,DataProtectionScope.CurrentUser),null,X509KeyStorageFlags.UserKeySet|X509KeyStorageFlags.PersistKeySet);
@@ -86,7 +113,11 @@ static class Program {
         var cert=req.CreateSelfSigned(DateTimeOffset.UtcNow.AddMinutes(-5),DateTimeOffset.UtcNow.AddYears(2));
         File.WriteAllBytes(path,ProtectedData.Protect(cert.Export(X509ContentType.Pfx),null,DataProtectionScope.CurrentUser));return X509CertificateLoader.LoadPkcs12(cert.Export(X509ContentType.Pfx),null,X509KeyStorageFlags.UserKeySet|X509KeyStorageFlags.PersistKeySet);
     }
-    static void WritePairing(X509Certificate2 cert) {File.WriteAllText(Path.Combine(data,"pairing.json"),JsonSerializer.Serialize(new{token=Identity.Bootstrap,expiresAt=Identity.Expires,deviceId=Identity.DeviceId,certificateSha256=Convert.ToHexString(SHA256.HashData(cert.RawData)).ToLowerInvariant()},Bridge.Json));}
+    static void WritePairing(X509Certificate2 cert) {
+        PairingInvite.WritePrivate(Path.Combine(data,"pairing.json"),JsonSerializer.Serialize(new{token=Identity.Bootstrap,expiresAt=Identity.Expires,deviceId=Identity.DeviceId,certificateSha256=Convert.ToHexString(SHA256.HashData(cert.RawData)).ToLowerInvariant()},Bridge.Json));
+        invitationCode=PairingInvite.Encode(Origin,Identity,cert);PairingInvite.WritePrivate(InvitationPath,invitationCode);
+    }
+    static void RequireAuth(HttpContext context){string header=context.Request.Headers.Authorization.ToString();if(!header.StartsWith("Bearer ")||!Equal(Identity.Token,header[7..]))throw new Fault("AUTH_FAILED",401);Interlocked.Exchange(ref lastPeerSeenTicks,DateTime.UtcNow.Ticks);}
     static bool Equal(string? a,string? b)=>a!=null&&b!=null&&CryptographicOperations.FixedTimeEquals(Encoding.UTF8.GetBytes(a),Encoding.UTF8.GetBytes(b));
     static async Task<T> Body<T>(HttpContext c) {
         if(c.Request.ContentLength>65536)throw new Fault("SIZE_LIMIT",413);
@@ -100,8 +131,8 @@ static class Program {
         app.Use(async(c,next)=> {
             try {
                 if(c.Request.Path!="/v1/pair") {
-                    var auth=c.Request.Headers.Authorization.ToString();if(!auth.StartsWith("Bearer ")||!Equal(Identity.Token,auth[7..]))throw new Fault("AUTH_FAILED",401);
-                    if(c.Request.Path!="/v1/hello"&&c.Request.Path!="/v1/pause"&&c.Request.Path!="/v1/unpair")await bridge.OnUI(()=>{bridge.CheckEpoch(c.Request.Headers["X-Connection-Epoch"].ToString());return true;});
+                    RequireAuth(c);
+                    if(c.Request.Path!="/v1/hello"&&c.Request.Path!="/v1/pause"&&c.Request.Path!="/v1/unpair"&&c.Request.Path!="/v1/settings")await bridge.OnUI(()=>{bridge.CheckEpoch(c.Request.Headers["X-Connection-Epoch"].ToString());return true;});
                 }
                 await next(c);
             }catch(Exception e) {
@@ -112,14 +143,19 @@ static class Program {
             }
         });
         app.MapPost("/v1/pair",async(HttpContext c)=> {
-            var request=await Body<PairRequest>(c);await pairLock.WaitAsync();
-            try {if(DateTimeOffset.UtcNow-pairWindow>TimeSpan.FromMinutes(1)){pairWindow=DateTimeOffset.UtcNow;pairAttempts=0;}
+            var request=await Body<PairRequest>(c);
+            return Results.Json(await bridge.OnUI(()=>{
+                if(DateTimeOffset.UtcNow-pairWindow>TimeSpan.FromMinutes(1)){pairWindow=DateTimeOffset.UtcNow;pairAttempts=0;}
                 if(++pairAttempts>5)throw new Fault("RATE_LIMIT",429);
                 Bridge.Uuid(request.DeviceId);if(Identity.Token!=null||DateTimeOffset.UtcNow>Identity.Expires||!Equal(Identity.Bootstrap,request.Token))throw new Fault("AUTH_FAILED",401);
-                Identity.Peer=request.DeviceId;Identity.Token=Convert.ToHexString(RandomNumberGenerator.GetBytes(32)).ToLowerInvariant();Identity.Bootstrap="";SaveIdentity();File.Delete(Path.Combine(data,"pairing.json"));
-                return Results.Json(new{token=Identity.Token,deviceId=Identity.DeviceId},Bridge.Json);
-            }finally{pairLock.Release();}
+                var paired=new Identity{DeviceId=Identity.DeviceId,Peer=request.DeviceId,Token=Convert.ToHexString(RandomNumberGenerator.GetBytes(32)).ToLowerInvariant(),Bootstrap="",Expires=Identity.Expires};
+                SaveIdentity(paired);Identity=paired;invitationCode="";File.Delete(Path.Combine(data,"pairing.json"));File.Delete(InvitationPath);bridge.Notify("Mac 已配对，正在连接");
+                return new{token=Identity.Token,deviceId=Identity.DeviceId};
+            }),Bridge.Json);
         });
+        // Explicit delegate type prevents ASP.NET binding this result-returning handler as RequestDelegate.
+        app.MapGet("/v1/settings",new Func<HttpContext,Task<IResult>>(async c=>Results.Json(await bridge.OnUI(()=>{RequireAuth(c);return bridge.Settings.Current;}),Bridge.Json)));
+        app.MapPost("/v1/settings",new Func<HttpContext,Task<IResult>>(async c=>{using var document=await Body<JsonDocument>(c);var change=SettingsChange.Parse(document.RootElement);return Results.Json(await bridge.OnUI(()=>{RequireAuth(c);return bridge.ApplySettings(change);}),Bridge.Json);}));
         app.MapPost("/v1/hello",async(HttpContext c)=> {var r=await Body<HelloRequest>(c);if(r.ProtocolVersion!=1)throw new Fault("PROTOCOL_UNSUPPORTED",400);if(r.DeviceId!=Identity.Peer)throw new Fault("AUTH_FAILED",401);return Results.Json(await bridge.OnUI(()=>bridge.Hello(r.SourceSessionId,r.HandshakeId,r.LastIssuedSourceSeq)),Bridge.Json);});
         app.MapGet("/v1/receiver-state",async()=>Results.Json(await bridge.OnUI(()=>bridge.State()),Bridge.Json));
         app.MapPost("/v1/head",async(HttpContext c)=> {var r=await Body<Head>(c);return Results.Json(await bridge.OnUI(()=>bridge.Announce(r)),Bridge.Json);});
@@ -155,33 +191,60 @@ static class Program {
         app.MapGet("/v1/transfers/{id}",async(string id)=>Results.Json(await bridge.OnUI(()=>{bridge.Observe();if(!bridge.Transfers.TryGetValue(id,out var t))throw new Fault("NOT_FOUND",404);return bridge.Result(t);}),Bridge.Json));
         app.MapPost("/v1/transfers/{id}/cancel",async(string id)=>Results.Json(await bridge.OnUI(()=>{if(!bridge.Transfers.TryGetValue(id,out var t))throw new Fault("NOT_FOUND",404);if(t.State!="Published"){t.State="Cancelled";t.Cancel.Cancel();}return bridge.Result(t);}),Bridge.Json));
         app.MapGet("/v1/outgoing/{id}/items/f1",async(HttpContext c,string id)=> {
-            var outgoing=await bridge.OnUI(()=>{bridge.Observe();var o=bridge.Out;if(o==null||o.TransferId!=id||o.State!="Ready")throw new Fault("SUPERSEDED");return o;});
+            var outgoing=await bridge.OnUI(()=>{bridge.Observe();bridge.AllowOutgoing();var o=bridge.Out;if(o==null||o.TransferId!=id||o.State!="Ready")throw new Fault("SUPERSEDED");bridge.AllowOutgoing(o.Kind);return o;});
             c.Response.ContentLength=outgoing.Item!.SizeBytes;c.Response.ContentType=outgoing.Item.Mime;
             using var cancellation=CancellationTokenSource.CreateLinkedTokenSource(c.RequestAborted,outgoing.Cancel.Token);
             await using var input=new FileStream(outgoing.Path,FileMode.Open,FileAccess.Read,FileShare.Read,65536,FileOptions.Asynchronous|FileOptions.SequentialScan);
             byte[] buffer=new byte[65536];long count=0,nextCheck=0;int reads=0,checks=0;double readMs=0,writeMs=0,checkMs=0;var watch=Stopwatch.StartNew();
             while(true){
                 long stamp=Stopwatch.GetTimestamp();int read=await input.ReadAsync(buffer,cancellation.Token);readMs+=Stopwatch.GetElapsedTime(stamp).TotalMilliseconds;if(read==0)break;reads++;
-                if(AtCheckpoint(ref nextCheck,count)){stamp=Stopwatch.GetTimestamp();await bridge.OnUI(()=>{bridge.CheckEpoch(c.Request.Headers["X-Connection-Epoch"].ToString());bridge.Observe();if(bridge.Out!=outgoing)throw new Fault("SUPERSEDED");return true;});checkMs+=Stopwatch.GetElapsedTime(stamp).TotalMilliseconds;checks++;}
+                if(AtCheckpoint(ref nextCheck,count)){stamp=Stopwatch.GetTimestamp();await bridge.OnUI(()=>{bridge.CheckEpoch(c.Request.Headers["X-Connection-Epoch"].ToString());bridge.AllowOutgoing(outgoing.Kind);bridge.Observe();if(bridge.Out!=outgoing)throw new Fault("SUPERSEDED");return true;});checkMs+=Stopwatch.GetElapsedTime(stamp).TotalMilliseconds;checks++;}
                 stamp=Stopwatch.GetTimestamp();await c.Response.Body.WriteAsync(buffer.AsMemory(0,read),cancellation.Token);writeMs+=Stopwatch.GetElapsedTime(stamp).TotalMilliseconds;count+=read;
             }
             Metric(new{at=DateTimeOffset.UtcNow,transferId=id,direction="windowsToMac",bytes=count,reads,checks,readMs,writeMs,checkMs,totalMs=watch.Elapsed.TotalMilliseconds});
         });
-        app.MapPost("/v1/pause",async(HttpContext c)=>{var r=await Body<PauseRequest>(c);return Results.Json(await bridge.OnUI(()=>{bridge.Pause(r.Paused);return new{paused=bridge.Paused};}),Bridge.Json);});
-        app.MapPost("/v1/unpair",async()=>Results.Json(await bridge.OnUI(()=>{Unpair(certificate);return new{unpaired=true};}),Bridge.Json));
+        app.MapPost("/v1/pause",async(HttpContext c)=>{var r=await Body<PauseRequest>(c);return Results.Json(await bridge.OnUI(()=>{RequireAuth(c);bridge.Pause(r.Paused);return new{paused=bridge.Paused};}),Bridge.Json);});
+        app.MapPost("/v1/unpair",new Func<HttpContext,Task<IResult>>(async c=>Results.Json(await bridge.OnUI(()=>{RequireAuth(c);DisconnectPeer();return new{unpaired=true};}),Bridge.Json)));
         return app;
     }
-    static void Unpair(X509Certificate2 certificate){bridge.Revoke();Identity.Token=null;Identity.Peer=null;Identity.Bootstrap=Convert.ToHexString(RandomNumberGenerator.GetBytes(32)).ToLowerInvariant();Identity.Expires=DateTimeOffset.UtcNow.AddMinutes(10);SaveIdentity();WritePairing(certificate);bridge.Notify("已解除配对");}
+    internal static void GenerateInvitation() {
+        if(!activeCertificate.MatchesHostname(bindAddress,false,false))throw new Fault("ADDRESS_CERTIFICATE_MISMATCH");
+        var replacement=new Identity{DeviceId=Identity.DeviceId};SaveIdentity(replacement);Identity=replacement;bridge.Revoke();WritePairing(activeCertificate);bridge.Notify("邀请已准备，请在 Mac 确认连接");
+    }
+    internal static void DisconnectPeer(){GenerateInvitation();bridge.Notify("已断开设备，可重新配对");}
+    internal static void CopyInvitation() {
+        if(!InvitationAvailable)throw new Fault("INVITATION_UNAVAILABLE");
+        var formats=new Dictionary<uint,byte[]> {{NativeClipboard.Marker,Encoding.UTF8.GetBytes(Guid.NewGuid().ToString()+"\0")},{NativeClipboard.Sensitive,new byte[]{1}},{NativeClipboard.ExcludeHistory,new byte[]{1}},{13,Encoding.Unicode.GetBytes(invitationCode+"\0")}};
+        if(!NativeClipboard.Publish(formats,()=>{if(!InvitationAvailable)throw new Fault("INVITATION_UNAVAILABLE");},out _))throw new Fault("CLIPBOARD_BUSY");
+    }
+    internal static void ExportInvitation(string path){if(!InvitationAvailable)throw new Fault("INVITATION_UNAVAILABLE");PairingInvite.WritePrivate(path,invitationCode);}
+    internal static void OpenReceived()=>Process.Start(new ProcessStartInfo("explorer.exe",bridge.Received){UseShellExecute=true});
+    static void OpenSettings(){if(settingsWindow==null){settingsWindow=new SettingsWindow(bridge);settingsWindow.Closed+=(_,_)=>settingsWindow=null;}settingsWindow.Show();if(settingsWindow.WindowState==WindowState.Minimized)settingsWindow.WindowState=WindowState.Normal;settingsWindow.Activate();}
     static void BuildTray(System.Windows.Application application) {
-        var menu=new Forms.ContextMenuStrip();var status=new Forms.ToolStripMenuItem(bridge.Status){Enabled=false};menu.Items.Add(status);
-        var pause=new Forms.ToolStripMenuItem("暂停同步");pause.Click+=(_,_)=>{bridge.Pause(!bridge.Paused);pause.Text=bridge.Paused?"恢复同步":"暂停同步";};menu.Items.Add(pause);
-        menu.Items.Add("打开接收文件夹",null,(_,_)=>System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo("explorer.exe",bridge.Received){UseShellExecute=true}));
-        menu.Items.Add("设备和配对信息",null,(_,_)=>Forms.MessageBox.Show("设备："+Identity.DeviceId+"\n配对资料："+data+"\n只同步连接后新复制的内容","CopyBridge"));
-        menu.Items.Add("解除配对",null,(_,_)=>{using var cert=Certificate();Unpair(cert);});menu.Items.Add("退出",null,(_,_)=>application.Shutdown());
+        var menu=new Forms.ContextMenuStrip();menu.Items.Add("打开设置",null,(_,_)=>OpenSettings());var status=new Forms.ToolStripMenuItem(bridge.Status){Enabled=false};menu.Items.Add(status);
+        var pause=new Forms.ToolStripMenuItem("暂停同步");pause.Click+=(_,_)=>{try{bridge.Pause(!bridge.Paused);}catch{Forms.MessageBox.Show("设置未能保存，请检查本机文件权限或可用空间。","CopyBridge");}};menu.Items.Add(pause);
+        menu.Items.Add("打开接收文件夹",null,(_,_)=>OpenReceived());
+        menu.Items.Add("连接设备",null,(_,_)=>OpenSettings());menu.Items.Add("退出",null,(_,_)=>application.Shutdown());
         tray=new Forms.NotifyIcon {Icon=System.Drawing.SystemIcons.Application,Text="CopyBridge：未连接",ContextMenuStrip=menu,Visible=true};
-        bridge.Changed+=()=>{status.Text=bridge.Status;tray.Text=("CopyBridge："+bridge.Status)[..Math.Min(63,("CopyBridge："+bridge.Status).Length)];try{File.WriteAllText(Path.Combine(data,"status.json"),JsonSerializer.Serialize(new{status=bridge.Status,paused=bridge.Paused,generation=bridge.Generation,sequence=bridge.Sequence,connected=bridge.Epoch!="",updatedAt=DateTimeOffset.UtcNow},Bridge.Json));}catch(IOException){}};
+        tray.DoubleClick+=(_,_)=>OpenSettings();
+        bridge.Changed+=()=>{pause.Text=bridge.Paused?"恢复同步":"暂停同步";status.Text=bridge.Status;tray.Text=("CopyBridge："+bridge.Status)[..Math.Min(63,("CopyBridge："+bridge.Status).Length)];try{File.WriteAllText(Path.Combine(data,"status.json"),JsonSerializer.Serialize(new{status=bridge.Status,paused=bridge.Paused,generation=bridge.Generation,sequence=bridge.Sequence,connected=bridge.Epoch!="",settingsRevision=bridge.Settings.Current.Revision,updatedAt=DateTimeOffset.UtcNow},Bridge.Json));}catch(IOException){}};
+    }
+    static void SingleInstanceSelfTest() {
+        string directory=Path.Combine(Path.GetTempPath(),"CopyBridge-launch-test-"+Guid.NewGuid().ToString("N"));Directory.CreateDirectory(directory);
+        try {
+            string key=InstanceKey(directory);
+            using var signal=new EventWaitHandle(false,EventResetMode.AutoReset,"Local\\CopyBridge-settings-"+key);
+            using var held=new Mutex(true,"Local\\CopyBridge-"+key);
+            File.WriteAllText(Path.Combine(directory,"runtime.json"),JsonSerializer.Serialize(new{pid=Environment.ProcessId}));
+            Process Child(string option){var start=new ProcessStartInfo(Path.Combine(AppContext.BaseDirectory,"CopyBridge.exe")){UseShellExecute=false};start.ArgumentList.Add("--data");start.ArgumentList.Add(directory);start.ArgumentList.Add(option);return Process.Start(start)??throw new Exception("Launch probe did not start");}
+            using(var child=Child("--notify-existing")){if(!signal.WaitOne(5000)||!child.WaitForExit(5000)||child.ExitCode!=0)throw new Exception("Secondary launch notification failed");}
+            using(var child=Child("--bootstrap")){if(!child.WaitForExit(5000)||child.ExitCode!=2||signal.WaitOne(100))throw new Exception("Bootstrap did not refuse existing instance");}
+            using var runtime=JsonDocument.Parse(File.ReadAllText(Path.Combine(directory,"runtime.json")));
+            if(runtime.RootElement.GetProperty("pid").GetInt32()!=Environment.ProcessId||File.Exists(Path.Combine(directory,"identity.dpapi")))throw new Exception("Secondary launch started another instance");
+        }finally{Directory.Delete(directory,true);}
     }
     static void SelfTest() {
+        SettingsStore.SelfTest();PairingInvite.SelfTest();SingleInstanceSelfTest();
         void Check(bool ok){if(!ok)throw new Exception("assertion failed");}
         foreach(var name in new[]{"../a","C:\\a","NUL.txt","a:ads","a.","a/1","CON","COM¹.txt","LPT²"}) {try{Bridge.ValidateName(name);throw new Exception("accepted bad name");}catch(Fault f){Check(f.Message=="INVALID_FILENAME");}}
         Bridge.ValidateName("图片 测试.png");
@@ -198,6 +261,6 @@ static class Program {
         using(var source=new CancellationTokenSource())using(var request=new CancellationTokenSource())using(var linked=CancellationTokenSource.CreateLinkedTokenSource(source.Token,request.Token)){source.Cancel();Check(linked.IsCancellationRequested);}
         Check(Equal("test","test")&&!Equal("test","test2")&&!Equal(null,null));
         var h=JsonSerializer.Deserialize<Head>("{\"connectionEpoch\":\"e\",\"sourceSessionId\":\"s\",\"sourceSeq\":42,\"transferId\":\"t\",\"receiverGenAtCopy\":7}",Bridge.Json)!;Check(h.SourceSeq==42&&h.ReceiverGenAtCopy==7);
-        File.WriteAllText("self-test-result.json",JsonSerializer.Serialize(new{status="PASS",checks=new[]{"filename-boundary","2GiB-integer-boundary","constant-time-auth","camelCase-contract","ordinary-single-files","fragmented-stream-checkpoint-bound","immediate-linked-cancellation","classic-DIB-color-bottom-up-alpha-padding"}},Bridge.Json));
+        File.WriteAllText("self-test-result.json",JsonSerializer.Serialize(new{status="PASS",checks=new[]{"filename-boundary","2GiB-integer-boundary","constant-time-auth","camelCase-contract","ordinary-single-files","fragmented-stream-checkpoint-bound","immediate-linked-cancellation","classic-DIB-color-bottom-up-alpha-padding","settings-atomic-revision-persistence","settings-strict-fields","private-invitation-boundaries","second-process-settings-notification","bootstrap-existing-instance-refusal"}},Bridge.Json));
     }
 }

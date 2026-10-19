@@ -21,6 +21,9 @@
     },
     {
       "$ref": "#/$defs/empty"
+    },
+    {
+      "$ref": "#/$defs/settings"
     }
   ],
   "$defs": {
@@ -305,6 +308,44 @@
       "additionalProperties": false,
       "properties": {},
       "required": []
+    },
+    "settings": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "expectedRevision": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9223372036854775807
+        },
+        "macToWindows": {
+          "type": "boolean"
+        },
+        "windowsToMac": {
+          "type": "boolean"
+        },
+        "text": {
+          "type": "boolean"
+        },
+        "image": {
+          "type": "boolean"
+        },
+        "file": {
+          "type": "boolean"
+        },
+        "paused": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "expectedRevision",
+        "macToWindows",
+        "windowsToMac",
+        "text",
+        "image",
+        "file",
+        "paused"
+      ]
     }
   }
 }

@@ -26,20 +26,24 @@ sealed class Bridge {
     internal static readonly JsonSerializerOptions Json=new(JsonSerializerDefaults.Web);
     internal readonly Dispatcher UI; internal readonly string Data,Received;
     internal string Epoch="",Session="",Handshake="",Current="",Status="未连接，请配对";
-    internal bool Paused; internal long Generation,HighWater,Floor; internal uint Sequence;
+    internal readonly SettingsStore Settings;
+    internal bool Paused=>Settings.Current.Paused; internal long Generation,HighWater,Floor; internal uint Sequence;
     internal Outgoing? Out; internal readonly Dictionary<string,Transfer> Transfers=new(StringComparer.OrdinalIgnoreCase);
     readonly Dictionary<string,long> sessionHigh=[];
     readonly SemaphoreSlim snapshotGate=new(1,1);
     internal event Action? Changed;
     internal Bridge(Dispatcher dispatcher,string data) {
-        UI=dispatcher; Data=data; Received=Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),"CopyBridge Received");
+        UI=dispatcher; Data=data;Settings=new SettingsStore(data); Received=Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),"CopyBridge Received");
         Directory.CreateDirectory(Received); Directory.CreateDirectory(Path.Combine(data,"outgoing"));
         Sequence=NativeClipboard.GetClipboardSequenceNumber();
     }
     internal Task<T> OnUI<T>(Func<T> f)=>UI.InvokeAsync(f).Task;
     internal void Notify(string s) {Status=s; try{File.AppendAllText(Path.Combine(Data,"events.jsonl"),JsonSerializer.Serialize(new{at=DateTimeOffset.UtcNow,transferId=Current,generation=Generation,sequence=Sequence,status=s},Json)+"\n");}catch(IOException){} Changed?.Invoke();}
     internal void Revoke() { foreach(var t in Transfers.Values)if(t.State is not ("Published" or "Failed" or "Cancelled")){t.State="Superseded";t.Cancel.Cancel();} Current=""; Out?.Cancel.Cancel(); Out=null; Epoch=""; Sequence=NativeClipboard.GetClipboardSequenceNumber(); }
-    internal void Pause(bool paused) {Paused=paused; Revoke(); Notify(paused?"已暂停":"等待重新连接，请重新复制");}
+    internal SyncPreferences ApplySettings(SettingsChange change) {var saved=Settings.Apply(change);Revoke();Notify(saved.Paused?"已暂停同步":"设置已保存，请重新复制");return saved;}
+    internal void Pause(bool paused)=>ApplySettings(SettingsChange.From(Settings.Current,paused));
+    internal void AllowIncoming(string? kind=null){if(!Settings.Current.MacToWindows)throw new Fault("DIRECTION_DISABLED");if(kind!=null&&!Settings.Current.AllowsKind(kind))throw new Fault("TYPE_DISABLED");}
+    internal void AllowOutgoing(string? kind=null){if(!Settings.Current.WindowsToMac)throw new Fault("DIRECTION_DISABLED");if(kind!=null&&!Settings.Current.AllowsKind(kind))throw new Fault("TYPE_DISABLED");}
     internal void Observe(bool snapshot=true) {
         if(NativeClipboard.SessionLocked()==true){if(Epoch!="")Revoke();const string locked="Windows 已锁定，请解锁后重新复制";if(Status!=locked)Notify(locked);return;}
         uint seq=NativeClipboard.GetClipboardSequenceNumber(); if(seq==0) {Notify("无法访问当前桌面剪贴板");return;}
@@ -52,13 +56,15 @@ sealed class Bridge {
         Sequence=seq;
         if(Epoch==""||Paused)return;
         Generation++; if(Current!="" && Transfers.TryGetValue(Current,out var previous) && previous.State!="Published"){previous.State="Superseded";previous.Cancel.Cancel();}
-        Current=""; Out?.Cancel.Cancel(); Out=new(Guid.NewGuid().ToString(),Generation); var outgoing=Out;
+        Current=""; Out?.Cancel.Cancel(); Out=null;
+        if(!Settings.Current.WindowsToMac){Notify("已保留 Windows 本机复制；发送方向已关闭");return;}
+        Out=new(Guid.NewGuid().ToString(),Generation);var outgoing=Out;
         Notify("正在准备 Windows 新复制");
         if(snapshot) UI.BeginInvoke(()=>Capture(outgoing,seq));
     }
     void Capture(Outgoing outgoing,uint seq) {
         if(Out!=outgoing||Paused||Epoch==""||NativeClipboard.GetClipboardSequenceNumber()!=seq)return;
-        try {var snapshot=NativeClipboard.Capture(); if(NativeClipboard.GetClipboardSequenceNumber()!=seq){Observe();return;}
+        try {AllowOutgoing();var snapshot=NativeClipboard.Capture(kind=>Settings.Current.AllowsKind(kind));AllowOutgoing(snapshot.Kind); if(NativeClipboard.GetClipboardSequenceNumber()!=seq){Observe();return;}
             _=BuildOutgoing(outgoing,snapshot);
         } catch(Exception e) {outgoing.State="Failed"; Notify(e is Fault?e.Message:"SOURCE_UNAVAILABLE");}
     }
@@ -82,7 +88,7 @@ sealed class Bridge {
                 File.Move(part,path); string hash; using(var f=File.OpenRead(path))hash=Convert.ToHexString(await SHA256.HashDataAsync(f,outgoing.Cancel.Token)).ToLowerInvariant();
                 outgoing.Path=path; return new Item("f1",snapshot.Name,snapshot.Mime,size,hash);
             });
-            await OnUI(()=> {if(Out==outgoing&&!Paused&&Epoch!=""){outgoing.Item=item;outgoing.Kind=snapshot.Kind;outgoing.State="Ready";Notify("Windows 新复制已准备，等待 Mac 接收");}return true;});
+            await OnUI(()=> {if(Out==outgoing&&!Paused&&Epoch!=""){AllowOutgoing(snapshot.Kind);outgoing.Item=item;outgoing.Kind=snapshot.Kind;outgoing.State="Ready";Notify("Windows 新复制已准备，等待 Mac 接收");}return true;});
         }catch(Exception e) {try{if(Directory.Exists(dir))Directory.Delete(dir,true);}catch{} await OnUI(()=> {if(Out==outgoing){outgoing.State="Failed";Notify(e is Fault?e.Message:"SOURCE_UNAVAILABLE");}return true;});}
         finally{if(acquired)snapshotGate.Release();}
     }
@@ -98,7 +104,7 @@ sealed class Bridge {
     internal void CheckEpoch(string epoch) {if(NativeClipboard.SessionLocked()==true)throw new Fault("SESSION_LOCKED");if(Paused||Epoch==""||epoch!=Epoch)throw new Fault("SESSION_REVOKED");}
     internal object State() {Observe();return new{connectionEpoch=Epoch,receiverGeneration=Generation,paused=Paused,outgoing=Out?.View(),status=Status};}
     internal object Announce(Head h) {
-        CheckEpoch(h.ConnectionEpoch); if(h.SourceSessionId!=Session)throw new Fault("SESSION_REVOKED");Uuid(h.TransferId);
+        CheckEpoch(h.ConnectionEpoch);AllowIncoming(); if(h.SourceSessionId!=Session)throw new Fault("SESSION_REVOKED");Uuid(h.TransferId);
         if(h.SourceSeq<0||h.ReceiverGenAtCopy<0)throw new Fault("INVALID_SEQUENCE",400);
         Observe();
         if(Transfers.TryGetValue(h.TransferId,out var known)) {if(known.Head!=h)throw new Fault("IDEMPOTENCY_CONFLICT"); if(known.Error!="")throw new Fault(known.Error);return Result(known);}
@@ -112,12 +118,12 @@ sealed class Bridge {
     }
     internal Transfer Valid(string id) {
         if(!Transfers.TryGetValue(id,out var t))throw new Fault("NOT_FOUND",404);
-        CheckEpoch(t.Head.ConnectionEpoch);Observe();
+        CheckEpoch(t.Head.ConnectionEpoch);AllowIncoming(t.Offer?.Kind);Observe();
         if(t.Head.ReceiverGenAtCopy!=Generation)throw new Fault("LOCAL_CLIPBOARD_CHANGED");
         if(Current!=id||t.Head.SourceSeq!=HighWater||t.State is "Failed" or "Cancelled" or "Superseded")throw new Fault("SUPERSEDED");return t;
     }
     internal object Accept(Offer offer) {
-        var t=Valid(offer.TransferId); if(t.Head!=offer.Head)throw new Fault("IDEMPOTENCY_CONFLICT");
+        var t=Valid(offer.TransferId);AllowIncoming(offer.Kind); if(t.Head!=offer.Head)throw new Fault("IDEMPOTENCY_CONFLICT");
         if(t.Offer!=null) {if(JsonSerializer.Serialize(t.Offer,Json)!=JsonSerializer.Serialize(offer,Json))throw new Fault("IDEMPOTENCY_CONFLICT");return Result(t);}
         if(offer.Items?.Length!=1)throw new Fault("TYPE_UNSUPPORTED",400);ValidateItem(offer.Kind,offer.Items[0]);
         long retained=Directory.EnumerateFiles(Received,"*",SearchOption.AllDirectories).Sum(p=>new FileInfo(p).Length);

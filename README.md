@@ -24,9 +24,23 @@ CopyBridge 把这件事接起来
 
 ## 怎么用
 
-1. 两端启动 CopyBridge，完成一次配对
-2. 在一台电脑复制文字、截图内容，或一个本地文件
-3. 等提示“可粘贴”，在另一台电脑正常粘贴
+两台电脑先接入同一局域网
+v0.2 可以在原生设置窗口里配对
+
+1. 在 Windows 托盘打开「设置」
+   进入「连接设备」，生成一次性邀请
+   复制配对码，或保存配对文件
+2. 在 Mac 菜单栏打开「设置」
+   导入配对文件，或粘贴配对码
+   预览并确认设备后，再点击连接
+3. 在任意一端打开「同步设置」
+   选择方向、内容类型和是否暂停
+   保存后，另一端会自动更新
+4. 复制文字、截图或一个本地文件
+   等提示「可粘贴」，在另一台正常粘贴
+
+邀请十分钟有效，成功使用一次即失效<br>
+首次连接的完整步骤见 [构建与配对](docs/SETUP.md)
 
 Mac 用 **Command+C / Command+V**<br>
 Windows 用 **Ctrl+C / Ctrl+V**
@@ -36,6 +50,21 @@ Windows 用 **Ctrl+C / Ctrl+V**
 
 ![复制、直传、核对、粘贴的工作流程](docs/art/copybridge-flow.svg)
 
+## 设置窗口里有什么
+
+| 页面 | 可以做什么 |
+| --- | --- |
+| 连接设备 | 查看设备与状态，生成或导入配对邀请 |
+| 同步设置 | 选择两个同步方向、文字、图片内容、文件和暂停 |
+| 工作原理 | 了解复制、加密直传、核对与可粘贴的过程 |
+
+Mac 从菜单栏进入，Windows 从托盘进入<br>
+关闭设置窗口后，后台同步继续运行
+
+修改设置、恢复或重新连接后<br>
+请重新复制需要同步的内容<br>
+程序不会补发之前的旧剪贴板
+
 ## 现在支持什么
 
 | 内容 | 当前范围 |
@@ -44,7 +73,8 @@ Windows 用 **Ctrl+C / Ctrl+V**
 | 静态图片内容 | 双向，最多 32 MiB、3200 万像素 |
 | 单个本地文件 | 双向，不限扩展名，最多 2 GiB，保留原始字节 |
 | 新复制优先 | 新内容撤销旧传输，目标电脑新复制的内容受到保护 |
-| 菜单与托盘 | 状态、暂停、取消、收到的文件、解除配对、退出 |
+| 菜单与托盘 | 打开设置、状态、暂停、收到的文件、断开设备、退出 |
+| 两端共享设置 | 任意一端保存方向、类型或暂停，另一端自动更新 |
 
 文件夹、多文件批次、未下载的云端文件、符号链接和富文本排版暂不支持
 视频按真实文件传输，目标软件是否接受视频粘贴，取决于软件自身
@@ -63,10 +93,20 @@ Windows 用 **Ctrl+C / Ctrl+V**
 不是对所有电脑、所有网络、所有软件的保证<br>
 更完整的版本和测试边界见 [验证记录](docs/VERIFICATION.md)
 
+v0.2 已核对 Mac 窗口导入配对<br>
+共享暂停、方向和类型开关的实际拦截<br>
+以及基本图文、文件的双向回归
+
+新版已在两台作者设备安装，安装后六项双向内容核对通过<br>
+Windows 原生窗口的逐项点击仍待本机验收<br>
+这些状态会继续记入验证记录
+
 ## 从源码开始
 
-这是供自行构建和配对的源码版本
-当前没有面向任意电脑的一键安装向导
+这是供自行构建的源码版本
+构建后，在两端设置窗口完成配对
+首次连接不需要手写配置文件
+当前没有通用的一键安装包
 
 Mac 需要 Apple Silicon 与 Swift 命令行工具（实测 macOS 26.0.1）
 Windows 需要 Windows 桌面环境与 .NET 10 SDK
@@ -84,8 +124,9 @@ dotnet publish apps/windows/CopyBridge.Windows.csproj -c Release -r win-x64 --se
 Start-Process .\build\windows\CopyBridge.exe -ArgumentList '--self-test' -Wait
 ```
 
-接下来按 [构建与配对](docs/SETUP.md) 配置你自己的两台电脑
-不要直接套用别人设备的证书、地址或配对资料
+接下来按 [构建与配对](docs/SETUP.md) 打开两端应用
+使用你自己的 Windows 生成配对邀请
+不要套用别人的设备资料
 
 ## 放在哪里，什么时候停
 
@@ -100,8 +141,9 @@ Start-Process .\build\windows\CopyBridge.exe -ArgumentList '--self-test' -Wait
 
 | 位置 | 负责什么 |
 | --- | --- |
-| `apps/macos/CopyBridge.swift` | Mac 菜单栏、剪贴板、文件快照、HTTPS 传输 |
+| `apps/macos/CopyBridge.swift` | Mac 原生设置、菜单栏、剪贴板与传输 |
 | `apps/windows/Program.cs` | Windows 托盘、HTTPS 接口与配对 |
+| `apps/windows/SettingsWindow.cs` | Windows 原生设置与邀请操作 |
 | `apps/windows/Bridge.cs` | 任务状态、新旧内容判定、接收与反向发送 |
 | `apps/windows/NativeClipboard.cs` | Windows 原生文字、图片与文件格式 |
 | `tests/protocol/check_server.py` | 连接真实接收端的协议检查工具 |

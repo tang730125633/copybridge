@@ -69,13 +69,17 @@ static class NativeClipboard
         sequence=inside;return true;
     }
     internal static readonly uint Png = RegisterClipboardFormat("PNG");
+    internal static readonly uint Sensitive = RegisterClipboardFormat("CopyBridge.Sensitive");
+    internal static readonly uint ExcludeHistory = RegisterClipboardFormat("ExcludeClipboardContentFromMonitorProcessing");
     internal static readonly uint Marker = RegisterClipboardFormat("CopyBridge.v1");
     internal static IntPtr Owner;
-    internal static ClipSnapshot Capture()
+    internal static ClipSnapshot Capture(Func<string,bool>? permitted=null)
     {
         var d=System.Windows.Clipboard.GetDataObject() ?? throw new Fault("TYPE_UNSUPPORTED");
-        if (d.GetDataPresent("ExcludeClipboardContentFromMonitorProcessing") || d.GetDataPresent("CanIncludeInClipboardHistory") && d.GetData("CanIncludeInClipboardHistory") is MemoryStream m && m.ToArray().All(b=>b==0)) throw new Fault("SENSITIVE_SOURCE");
+        if (d.GetDataPresent("CopyBridge.Sensitive") || d.GetDataPresent("ExcludeClipboardContentFromMonitorProcessing") || d.GetDataPresent("CanIncludeInClipboardHistory") && d.GetData("CanIncludeInClipboardHistory") is MemoryStream m && m.ToArray().All(b=>b==0)) throw new Fault("SENSITIVE_SOURCE");
+        void Permit(string kind){if(permitted!=null&&!permitted(kind))throw new Fault("TYPE_DISABLED");}
         if(d.GetDataPresent(DataFormats.FileDrop)) {
+            Permit("file");
             var files=d.GetData(DataFormats.FileDrop) as string[];
             if(files?.Length!=1) throw new Fault("TYPE_UNSUPPORTED");
             var f=new FileInfo(files[0]);
@@ -83,12 +87,14 @@ static class NativeClipboard
             string mime=Path.GetExtension(f.Name).ToLowerInvariant() switch {".png"=>"image/png", ".jpg" or ".jpeg"=>"image/jpeg", ".mp4"=>"video/mp4", _=>"application/octet-stream"};
             return new("file",f.Name,mime,null,f.FullName);
         }
-        if(d.GetDataPresent("PNG") && d.GetData("PNG") is Stream png) {
+        if(d.GetDataPresent("PNG")) {
+            Permit("image");if(d.GetData("PNG") is not Stream png)throw new Fault("TYPE_UNSUPPORTED");
             if(png.Length>32*1024*1024) throw new Fault("SIZE_LIMIT");
             using var ms=new MemoryStream(); png.Position=0; png.CopyTo(ms);
             var bytes=ms.ToArray(); ValidateImage(bytes); return new("image","clipboard.png","image/png",bytes,null);
         }
         if(System.Windows.Clipboard.ContainsImage()) {
+            Permit("image");
             var bmp=System.Windows.Clipboard.GetImage() ?? throw new Fault("TYPE_UNSUPPORTED");
             CheckPixels(bmp.PixelWidth,bmp.PixelHeight);
             var encoder=new PngBitmapEncoder(); encoder.Frames.Add(BitmapFrame.Create(bmp));
@@ -97,6 +103,7 @@ static class NativeClipboard
             return new("image","clipboard.png","image/png",ms.ToArray(),null);
         }
         if(d.GetDataPresent(DataFormats.UnicodeText)) {
+            Permit("text");
             var value=d.GetData(DataFormats.UnicodeText) as string ?? "";
             byte[] bytes=Encoding.UTF8.GetBytes(value);
             if(bytes.Length>1024*1024)throw new Fault("SIZE_LIMIT");

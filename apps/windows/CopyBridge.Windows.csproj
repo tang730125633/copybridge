@@ -3,7 +3,7 @@
     <OutputType>WinExe</OutputType><TargetFramework>net10.0-windows</TargetFramework>
     <UseWPF>true</UseWPF><UseWindowsForms>true</UseWindowsForms><Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings><EnableDefaultApplicationDefinition>false</EnableDefaultApplicationDefinition>
-    <AssemblyName>CopyBridge</AssemblyName><Version>0.1.0</Version>
+    <AssemblyName>CopyBridge</AssemblyName><Version>0.2.0</Version>
   </PropertyGroup>
   <ItemGroup><FrameworkReference Include="Microsoft.AspNetCore.App" /></ItemGroup>
 </Project>

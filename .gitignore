@@ -12,3 +12,6 @@ config.json
 identity.json
 self-test-result.json
 self-test-failure.txt
+
+# One-time device invitations contain pairing credentials.
+*.copybridge
