@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="520" viewBox="0 0 1200 520" role="img" aria-labelledby="title desc">
+<title id="title">CopyBridge：复制、直传、核对、粘贴</title><desc id="desc">Mac 与 Windows 通过局域网双向传输文字和单文件，长度和内容摘要核对通过后写入系统剪贴板。新复制优先。</desc>
+<defs><marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M1 1 L9 5 L1 9" fill="none" stroke="#d65336" stroke-width="1.8"/></marker></defs>
+<rect width="1200" height="520" rx="8" fill="#f1eee4"/>
+<g fill="#171612" font-family="-apple-system, BlinkMacSystemFont, 'PingFang SC', 'Microsoft YaHei', sans-serif">
+<text x="52" y="58" font-size="15" letter-spacing="3">COPYBRIDGE / HOW IT WORKS</text>
+<text x="52" y="110" font-size="36" font-weight="650">复制之后，另一台电脑就能接着用</text>
+<path d="M52 142H1148" stroke="#171612" stroke-opacity=".22"/>
+<g stroke="#171612" stroke-width="2" fill="none"><rect x="85" y="198" width="230" height="138" rx="8"/><path d="M65 350H335L315 363H85Z"/><rect x="885" y="198" width="230" height="138" rx="8"/><path d="M1000 337V363M955 363H1045"/></g>
+<text x="200" y="246" text-anchor="middle" font-size="28" font-weight="650">Mac</text><text x="200" y="291" text-anchor="middle" font-size="21">Command + C</text>
+<text x="1000" y="246" text-anchor="middle" font-size="28" font-weight="650">Windows</text><text x="1000" y="291" text-anchor="middle" font-size="21">Ctrl + V</text>
+<path d="M362 250H456M744 250H838" stroke="#d65336" stroke-width="2.5" marker-end="url(#arrow)"/>
+<rect x="472" y="188" width="256" height="140" rx="8" fill="#e7e1d3" stroke="#171612" stroke-width="1.4"/>
+<text x="600" y="226" text-anchor="middle" font-size="20" font-weight="650">局域网直接传输</text><text x="600" y="263" text-anchor="middle" font-size="17">传完 · 核对长度与内容</text><text x="600" y="298" text-anchor="middle" font-size="19" font-weight="650">确认后，才可粘贴</text>
+<path d="M838 383H362" stroke="#d65336" stroke-width="2" marker-end="url(#arrow)"/><text x="600" y="418" text-anchor="middle" font-size="17">反过来也支持：Windows Ctrl+C → Mac Command+V</text>
+<path d="M52 447H1148" stroke="#171612" stroke-opacity=".22"/>
+<text x="52" y="483" font-size="16">新复制优先　·　一次一个本地文件　·　文件最大 2 GiB</text><text x="1148" y="483" text-anchor="end" font-size="14" fill="#6e6a61">工作流程示意，不是实时状态</text>
+</g></svg>

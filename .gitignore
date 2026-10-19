@@ -1,0 +1,14 @@
+build/
+bin/
+obj/
+__pycache__/
+*.pyc
+.DS_Store
+*.dpapi
+*.pfx
+*.key
+pairing.json
+config.json
+identity.json
+self-test-result.json
+self-test-failure.txt

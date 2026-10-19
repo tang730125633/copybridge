@@ -1,0 +1,310 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:copybridge:protocol:v1:requests",
+  "title": "CopyBridge v1 control request bodies",
+  "description": "Validate the endpoint-specific $defs. Header authentication/epoch checks, immutable event bindings, MIME/extension/name consistency and actual byte integrity are runtime constraints. JSON bodies max 65536 bytes.",
+  "oneOf": [
+    {
+      "$ref": "#/$defs/pair"
+    },
+    {
+      "$ref": "#/$defs/hello"
+    },
+    {
+      "$ref": "#/$defs/head"
+    },
+    {
+      "$ref": "#/$defs/offer"
+    },
+    {
+      "$ref": "#/$defs/pause"
+    },
+    {
+      "$ref": "#/$defs/empty"
+    }
+  ],
+  "$defs": {
+    "pair": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "deviceId": {
+          "type": "string",
+          "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+        },
+        "token": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096
+        }
+      },
+      "required": [
+        "deviceId",
+        "token"
+      ]
+    },
+    "hello": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "protocolVersion": {
+          "const": 1
+        },
+        "deviceId": {
+          "type": "string",
+          "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+        },
+        "sourceSessionId": {
+          "type": "string",
+          "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+        },
+        "handshakeId": {
+          "type": "string",
+          "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+        },
+        "lastIssuedSourceSeq": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9223372036854775807
+        }
+      },
+      "required": [
+        "protocolVersion",
+        "deviceId",
+        "sourceSessionId",
+        "handshakeId",
+        "lastIssuedSourceSeq"
+      ]
+    },
+    "head": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "connectionEpoch": {
+          "type": "string",
+          "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+        },
+        "sourceSessionId": {
+          "type": "string",
+          "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+        },
+        "transferId": {
+          "type": "string",
+          "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+        },
+        "sourceSeq": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9223372036854775807
+        },
+        "receiverGenAtCopy": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9223372036854775807
+        }
+      },
+      "required": [
+        "connectionEpoch",
+        "sourceSessionId",
+        "transferId",
+        "sourceSeq",
+        "receiverGenAtCopy"
+      ]
+    },
+    "item": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "itemId": {
+          "const": "f1"
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 180
+        },
+        "mime": {
+          "enum": [
+            "text/plain",
+            "image/png",
+            "image/jpeg",
+            "video/mp4",
+            "application/octet-stream"
+          ]
+        },
+        "sizeBytes": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 2147483648
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        }
+      },
+      "required": [
+        "itemId",
+        "name",
+        "mime",
+        "sizeBytes",
+        "sha256"
+      ]
+    },
+    "offer": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "connectionEpoch": {
+          "type": "string",
+          "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+        },
+        "sourceSessionId": {
+          "type": "string",
+          "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+        },
+        "transferId": {
+          "type": "string",
+          "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+        },
+        "sourceSeq": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9223372036854775807
+        },
+        "receiverGenAtCopy": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9223372036854775807
+        },
+        "kind": {
+          "enum": [
+            "text",
+            "image",
+            "file"
+          ]
+        },
+        "items": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1,
+          "items": {
+            "$ref": "#/$defs/item"
+          }
+        }
+      },
+      "required": [
+        "connectionEpoch",
+        "sourceSessionId",
+        "transferId",
+        "sourceSeq",
+        "receiverGenAtCopy",
+        "kind",
+        "items"
+      ],
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "text"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "items": {
+                "items": {
+                  "properties": {
+                    "sizeBytes": {
+                      "maximum": 1048576
+                    },
+                    "mime": {
+                      "enum": [
+                        "text/plain"
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "image"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "items": {
+                "items": {
+                  "properties": {
+                    "sizeBytes": {
+                      "maximum": 33554432
+                    },
+                    "mime": {
+                      "enum": [
+                        "image/png"
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "file"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "items": {
+                "items": {
+                  "properties": {
+                    "sizeBytes": {
+                      "maximum": 2147483648
+                    },
+                    "mime": {
+                      "enum": [
+                        "image/png",
+                        "image/jpeg",
+                        "video/mp4",
+                        "application/octet-stream"
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "pause": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "paused": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "paused"
+      ]
+    },
+    "empty": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {},
+      "required": []
+    }
+  }
+}
