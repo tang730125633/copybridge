@@ -81,7 +81,7 @@ struct Invitation: Codable {
         guard text.utf8.count <= 16384 else { throw BridgeError("INVITATION_SIZE_LIMIT") }
         let clean = text.trimmingCharacters(in:.whitespacesAndNewlines)
         guard clean.hasPrefix("COPYBRIDGE1:") else { throw BridgeError("INVALID_INVITATION") }
-        let payload = String(clean.dropFirst(12))
+        let payload = String(clean.dropFirst(12).filter { !$0.isWhitespace })
         guard !payload.isEmpty, payload.count % 4 != 1, payload.allSatisfy({ "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_".contains($0) }) else { throw BridgeError("INVALID_INVITATION") }
         let base64 = payload.replacingOccurrences(of:"-",with:"+").replacingOccurrences(of:"_",with:"/") + String(repeating:"=",count:(4-payload.count%4)%4)
         guard let bytes = Data(base64Encoded:base64), bytes.count <= 12288 else { throw BridgeError("INVITATION_SIZE_LIMIT") }
@@ -98,6 +98,70 @@ func invitationText(at url: URL) throws -> String {
     guard let text = String(data:bytes,encoding:.utf8) else { throw BridgeError("INVALID_INVITATION") }
     return text
 }
+struct QuickEnvelope: Codable { let version: Int; let sealed: String }
+enum QuickPair {
+    static let context = "CopyBridge quick pairing v1"
+    static let alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+    static func code(_ value: String) throws -> String {
+        let clean = String(value.uppercased().filter { !$0.isWhitespace && $0 != "-" })
+        guard clean.count == 20, clean.allSatisfy({ alphabet.contains($0) }) else { throw BridgeError("QUICK_CODE_INVALID") }
+        return clean
+    }
+    static func origin(_ value: String) throws -> String {
+        let value = value.trimmingCharacters(in:.whitespacesAndNewlines)
+        let result = value.hasPrefix("https://") ? value : "https://" + value + (value.contains(":") ? "" : ":43861")
+        guard privateOrigin(result) else { throw BridgeError("QUICK_ADDRESS_INVALID") }
+        return result
+    }
+    static func open(_ data: Data, code value: String, origin address: String) throws -> Invitation {
+        guard data.count <= 32768 else { throw BridgeError("RESPONSE_SIZE_LIMIT") }
+        let packet = try JSONDecoder().decode(QuickEnvelope.self,from:data)
+        guard packet.version == 1, let bytes = Data(base64Encoded:packet.sealed), bytes.count >= 28, bytes.count <= 16412 else { throw BridgeError("QUICK_PACKET_INVALID") }
+        let key = SymmetricKey(data:SHA256.hash(data:Data((context + "\n" + (try code(value))).utf8)))
+        let plain: Data
+        do { plain = try AES.GCM.open(AES.GCM.SealedBox(combined:bytes),using:key,authenticating:Data(context.utf8)) }
+        catch { throw BridgeError("QUICK_CODE_WRONG") }
+        guard let text = String(data:plain,encoding:.utf8) else { throw BridgeError("QUICK_PACKET_INVALID") }
+        let invitation = try Invitation.decode(text)
+        guard invitation.url == (try origin(address)) else { throw BridgeError("QUICK_ADDRESS_MISMATCH") }
+        return invitation
+    }
+    static func fetch(address: String, code value: String) async throws -> Invitation {
+        let address = try origin(address), normalized = try code(value)
+        let output = support.appendingPathComponent("quick-\(UUID().uuidString).tmp")
+        guard FileManager.default.createFile(atPath:output.path,contents:nil,attributes:[.posixPermissions:0o600]) else { throw BridgeError("LOCAL_IO_FAILED") }
+        defer { try? FileManager.default.removeItem(at:output) }
+        let process = Process(), result = Pipe(), job = CurlJob()
+        process.executableURL = URL(fileURLWithPath:"/usr/bin/curl")
+        // This unauthenticated request carries no secrets and accepts only AEAD ciphertext.
+        // The code authenticates the embedded certificate before normal pinned TLS pairing.
+        process.arguments = ["-q","--insecure","--silent","--noproxy","*","--proto","=https","--max-redirs","0","--connect-timeout","4","--max-time","10","--max-filesize","32768","--output",output.path,"--write-out","%{http_code}",address + "/v1/pairing/quick"]
+        process.standardOutput = result; process.standardError = FileHandle.nullDevice
+        let status: Int = try await withTaskCancellationHandler(operation:{
+            try await withCheckedThrowingContinuation { continuation in
+                process.terminationHandler = { finished in
+                    let bytes = result.fileHandleForReading.readDataToEndOfFile()
+                    try? result.fileHandleForReading.close()
+                    job.finish {
+                        if finished.terminationStatus == 0, let code = Int(String(decoding:bytes,as:UTF8.self)) { continuation.resume(returning:code) }
+                        else { continuation.resume(throwing:BridgeError("QUICK_NETWORK_FAILED")) }
+                    }
+                }
+                do { try job.start(process) } catch { process.terminationHandler = nil; job.finish { continuation.resume(throwing:error) } }
+            }
+        },onCancel:{ job.cancel() })
+        try Task.checkCancellation()
+        guard status == 200 else { throw BridgeError(status == 409 ? "QUICK_UNAVAILABLE" : "QUICK_NETWORK_FAILED") }
+        let bytes = try invitationSizedData(output)
+        return try open(bytes,code:normalized,origin:address)
+    }
+    static func invitationSizedData(_ url: URL) throws -> Data {
+        let file = try FileHandle(forReadingFrom:url);defer { try? file.close() }
+        let bytes = try file.read(upToCount:32769) ?? Data()
+        guard bytes.count <= 32768 else { throw BridgeError("RESPONSE_SIZE_LIMIT") };return bytes
+    }
+}
+
 struct Item: Codable { var itemId = "f1"; var name: String; var mime: String; var sizeBytes: Int64; var sha256: String }
 struct Outgoing: Codable { var transferId: String; var generation: Int64; var kind: String; var item: Item?; var state: String }
 struct State: Codable { var connectionEpoch: String; var receiverGeneration: Int64; var paused: Bool?; var outgoing: Outgoing?; var status: String? }
@@ -307,14 +371,22 @@ func snapshot(_ source: Source, id: String) throws -> Snapshot {
 @MainActor final class SettingsWindow: NSObject, NSTextFieldDelegate {
     unowned let app: App
     let window: NSWindow
-    let tabs = NSSegmentedControl(labels:["连接设备","同步设置","工作原理"],trackingMode:.selectOne,target:nil,action:nil)
+    let tabs = NSSegmentedControl(labels:["首页","连接设备","同步设置","使用帮助"],trackingMode:.selectOne,target:nil,action:nil)
+    let homeDevice = NSTextField(wrappingLabelWithString:"")
+    let homeHint = NSTextField(wrappingLabelWithString:"")
+    let homePause = NSButton(title:"暂停同步",target:nil,action:nil)
     let liveStatus = NSTextField(wrappingLabelWithString:"")
     let connectionInfo = NSTextField(wrappingLabelWithString:"")
     let invitationField = NSSecureTextField()
-    let previewInfo = NSTextField(wrappingLabelWithString:"先导入或粘贴 Windows 配对码，再预览设备。")
+    let addressField = NSTextField()
+    let quickCodeField = NSSecureTextField()
+    let legacyConnectButton = NSButton(title:"连接这台 Windows",target:nil,action:nil)
+    var legacySection: NSView!
+    var quickTask: Task<Void,Never>?
+    let previewInfo = NSTextField(wrappingLabelWithString:"粘贴后会自动显示电脑名称，无需手动输入长码。")
     let pairingFeedback = NSTextField(wrappingLabelWithString:"")
     let importButton = NSButton(title:"选择配对文件…",target:nil,action:nil)
-    let previewButton = NSButton(title:"预览设备",target:nil,action:nil)
+    let pasteButton = NSButton(title:"粘贴配对码",target:nil,action:nil)
     let connectButton = NSButton(title:"连接这台 Windows",target:nil,action:nil)
     let saveButton = NSButton(title:"保存到两台设备",target:nil,action:nil)
     let settingsFeedback = NSTextField(wrappingLabelWithString:"连接设备后，即可设置同步范围。")
@@ -328,13 +400,17 @@ func snapshot(_ source: Source, id: String) throws -> Snapshot {
         self.app = app
         window = NSWindow(contentRect:NSRect(x:0,y:0,width:760,height:740),styleMask:[.titled,.closable,.miniaturizable,.resizable],backing:.buffered,defer:false)
         super.init()
-        window.title = "CopyBridge 设置"; window.isReleasedWhenClosed = false; window.minSize = NSSize(width:720,height:700)
-        window.appearance = NSAppearance(named:.aqua); window.backgroundColor = NSColor(calibratedRed:0.985,green:0.977,blue:0.958,alpha:1)
+        window.title = "CopyBridge"; window.isReleasedWhenClosed = false; window.minSize = NSSize(width:720,height:700)
+        window.appearance = NSAppearance(named:.aqua); window.backgroundColor = NSColor(calibratedRed:0.96,green:0.97,blue:0.99,alpha:1)
         window.setAccessibilityIdentifier("copybridge_settings_window")
         let content = window.contentView!
         let root = stack([],spacing:18); content.addSubview(root)
         NSLayoutConstraint.activate([root.leadingAnchor.constraint(equalTo:content.leadingAnchor,constant:32),root.trailingAnchor.constraint(equalTo:content.trailingAnchor,constant:-32),root.topAnchor.constraint(equalTo:content.topAnchor,constant:28),root.bottomAnchor.constraint(lessThanOrEqualTo:content.bottomAnchor,constant:-24)])
-        root.addArrangedSubview(label("CopyBridge",size:28,weight:.semibold))
+        let brandIcon = NSImageView()
+        if let path = Bundle.main.path(forResource:"AppIcon",ofType:"png") { brandIcon.image = NSImage(contentsOfFile:path) }
+        brandIcon.setAccessibilityLabel("CopyBridge 图标")
+        NSLayoutConstraint.activate([brandIcon.widthAnchor.constraint(equalToConstant:48),brandIcon.heightAnchor.constraint(equalToConstant:48)])
+        root.addArrangedSubview(stack([brandIcon,label("CopyBridge",size:28,weight:.semibold)],spacing:12,horizontal:true))
         root.addArrangedSubview(label("两台电脑，用原来的方式复制粘贴",size:13,color:.secondaryLabelColor))
         liveStatus.font = .systemFont(ofSize:12,weight:.medium); liveStatus.textColor = NSColor(calibratedRed:0.15,green:0.40,blue:0.34,alpha:1)
         liveStatus.setAccessibilityIdentifier("connection_status"); root.addArrangedSubview(liveStatus)
@@ -342,7 +418,7 @@ func snapshot(_ source: Source, id: String) throws -> Snapshot {
         root.addArrangedSubview(tabs)
         let pageHost = NSView(); pageHost.translatesAutoresizingMaskIntoConstraints = false; root.addArrangedSubview(pageHost)
         NSLayoutConstraint.activate([pageHost.widthAnchor.constraint(equalTo:root.widthAnchor),pageHost.heightAnchor.constraint(greaterThanOrEqualToConstant:430)])
-        pages = [connectionPage(),syncPage(),principlesPage()]
+        pages = [homePage(),connectionPage(),syncPage(),principlesPage()]
         for (index,page) in pages.enumerated() {
             pageHost.addSubview(page); page.isHidden = index != 0
             NSLayoutConstraint.activate([page.leadingAnchor.constraint(equalTo:pageHost.leadingAnchor),page.trailingAnchor.constraint(equalTo:pageHost.trailingAnchor),page.topAnchor.constraint(equalTo:pageHost.topAnchor),page.bottomAnchor.constraint(lessThanOrEqualTo:pageHost.bottomAnchor)])
@@ -372,17 +448,79 @@ func snapshot(_ source: Source, id: String) throws -> Snapshot {
         return box
     }
     func connectionPage() -> NSView {
-        invitationField.placeholderString = "粘贴 Windows 配对码"; invitationField.font = .systemFont(ofSize:13); invitationField.delegate = self
-        invitationField.setAccessibilityLabel("Windows 配对码，输入内容受保护"); invitationField.setAccessibilityIdentifier("invitation_input"); invitationField.heightAnchor.constraint(equalToConstant:34).isActive = true
-        for button in [importButton,previewButton,connectButton] { button.bezelStyle = .rounded; button.target = self }
-        importButton.action = #selector(importInvitation); importButton.setAccessibilityIdentifier("import_invitation")
-        previewButton.action = #selector(previewInvitation); previewButton.setAccessibilityIdentifier("preview_invitation")
-        connectButton.action = #selector(connectInvitation); connectButton.isEnabled = false; connectButton.bezelColor = NSColor(calibratedRed:0.18,green:0.42,blue:0.36,alpha:1); connectButton.setAccessibilityIdentifier("connect_device")
-        previewInfo.font = .systemFont(ofSize:13); previewInfo.setAccessibilityIdentifier("invitation_preview")
-        pairingFeedback.font = .systemFont(ofSize:12); pairingFeedback.textColor = .secondaryLabelColor; pairingFeedback.setAccessibilityIdentifier("pairing_feedback")
+        addressField.placeholderString = "Windows 地址，例如 192.168.0.121"
+        if let text = app.config?.url, let url = URL(string:text), let host = url.host { addressField.stringValue = host + ((url.port ?? 43861) == 43861 ? "" : ":\(url.port!)") }
+        quickCodeField.placeholderString = "粘贴 Windows 显示的 20 位连接口令"
+        addressField.setAccessibilityIdentifier("quick_address"); addressField.setAccessibilityLabel("Windows 地址")
+        quickCodeField.setAccessibilityIdentifier("quick_code"); quickCodeField.setAccessibilityLabel("短连接口令")
+        for field in [addressField,quickCodeField] { field.font = .systemFont(ofSize:14); field.heightAnchor.constraint(equalToConstant:36).isActive = true }
+        pasteButton.title = "粘贴连接信息"; pasteButton.target = self; pasteButton.action = #selector(pasteQuickConnection); pasteButton.bezelStyle = .rounded
+        pasteButton.setAccessibilityIdentifier("paste_connection")
+        connectButton.title = "连接"; connectButton.target = self; connectButton.action = #selector(connectQuick); connectButton.bezelStyle = .rounded; connectButton.bezelColor = .systemBlue
+        connectButton.setAccessibilityIdentifier("connect_quick")
+        pairingFeedback.font = .systemFont(ofSize:13); pairingFeedback.textColor = .secondaryLabelColor; pairingFeedback.setAccessibilityIdentifier("pairing_feedback")
+        invitationField.placeholderString = "旧版完整配对码"; invitationField.delegate = self; invitationField.setAccessibilityIdentifier("invitation_input"); invitationField.setAccessibilityLabel("旧版配对码")
+        let legacyPaste = NSButton(title:"粘贴旧配对码",target:self,action:#selector(pasteInvitation)); legacyPaste.bezelStyle = .rounded
+        importButton.bezelStyle = .rounded; importButton.target = self; importButton.action = #selector(importInvitation)
+        legacyConnectButton.bezelStyle = .rounded; legacyConnectButton.target = self; legacyConnectButton.action = #selector(connectInvitation); legacyConnectButton.isEnabled = false
+        legacySection = page([invitationField,stack([legacyPaste,importButton],horizontal:true),previewInfo,legacyConnectButton]); legacySection.isHidden = true
+        let legacyToggle = NSButton(title:"旧版配对码或文件…",target:self,action:#selector(toggleLegacy)); legacyToggle.bezelStyle = .rounded
         connectionInfo.font = .systemFont(ofSize:12); connectionInfo.textColor = .secondaryLabelColor
-        return page([label("连接你的 Windows",size:20,weight:.semibold),label("在 Windows 的 CopyBridge 设置中生成配对码。\n粘贴或导入后，先确认设备，再连接。",color:.secondaryLabelColor),invitationField,stack([importButton,previewButton],horizontal:true),card([previewInfo]),stack([connectButton],horizontal:true),pairingFeedback,connectionInfo])
+        return page([label("连接你的 Windows",size:20,weight:.semibold),label("在 Windows 点击「复制连接信息」。\n到这台 Mac 复制那行文字，点击下面粘贴，再点连接。",color:.secondaryLabelColor),stack([pasteButton],horizontal:true),label("Windows 地址",weight:.medium),addressField,label("连接口令",weight:.medium),quickCodeField,stack([connectButton],horizontal:true),pairingFeedback,stack([legacyToggle],horizontal:true),legacySection])
     }
+    @objc func toggleLegacy() { legacySection.isHidden.toggle() }
+    @objc func pasteQuickConnection() {
+        readQuickConnection(from:.general)
+    }
+    func readQuickConnection(from board: NSPasteboard) {
+        quickCodeField.stringValue = ""
+        guard let text = board.string(forType:.string), !text.trimmingCharacters(in:.whitespacesAndNewlines).isEmpty else { pairingFeedback.stringValue = "先复制 Windows 的连接信息，再点这里。"; return }
+        if text.trimmingCharacters(in:.whitespacesAndNewlines).hasPrefix("COPYBRIDGE1:") { legacySection.isHidden = false; readInvitation(from:board); return }
+        let parts = text.split(whereSeparator: { $0.isWhitespace }).map(String.init)
+        do {
+            if parts.count > 1 { _ = try QuickPair.origin(parts[0]); addressField.stringValue = parts[0]; quickCodeField.stringValue = try QuickPair.code(parts.dropFirst().joined()) }
+            else { quickCodeField.stringValue = try QuickPair.code(text) }
+            pairingFeedback.stringValue = "已填好，点击「连接」即可。"
+        } catch { pairingFeedback.stringValue = "没有识别到连接信息，请在 Windows 点击「复制连接信息」后重试。" }
+    }
+    @objc func connectQuick() {
+        let address = addressField.stringValue, code = quickCodeField.stringValue
+        do { _ = try QuickPair.origin(address); _ = try QuickPair.code(code) }
+        catch { pairingFeedback.stringValue = errorCode(error) == "QUICK_ADDRESS_INVALID" ? "请填写 Windows 显示的地址。" : "请输入 Windows 显示的 20 位连接口令，或直接粘贴连接信息。"; return }
+        pairingBusy(true); pairingFeedback.stringValue = "正在连接 Windows…"
+        quickTask = Task {
+            do { let invite = try await QuickPair.fetch(address:address,code:code); await app.pair(invite) }
+            catch {
+                pairingBusy(false)
+                switch errorCode(error) {
+                case "QUICK_CODE_WRONG", "QUICK_CODE_INVALID": pairingFeedback.stringValue = "连接口令不对，请在 Windows 重新复制连接信息。"
+                case "QUICK_UNAVAILABLE", "INVITATION_EXPIRED_OR_INVALID_TIME": pairingFeedback.stringValue = "连接信息已过期或已使用，请在 Windows 重新准备连接。"
+                default: pairingFeedback.stringValue = "没有连上 Windows，请确认地址、同一网络，以及 Windows 已打开新版 CopyBridge。"
+                }
+            }
+            quickTask = nil
+        }
+    }
+    func homePage() -> NSView {
+        homeDevice.font = .systemFont(ofSize:19,weight:.semibold)
+        homeHint.font = .systemFont(ofSize:13); homeHint.textColor = .secondaryLabelColor
+        homeHint.setAccessibilityIdentifier("home_next_step")
+        let connect = NSButton(title:"查看连接设备",target:self,action:#selector(openConnection))
+        let files = NSButton(title:"打开收到的文件",target:app,action:#selector(App.openReceived))
+        homePause.target = app; homePause.action = #selector(App.togglePause)
+        for button in [connect,files,homePause] { button.bezelStyle = .rounded }
+        return page([
+            label("复制一下，换台电脑继续",size:23,weight:.semibold),
+            card([homeDevice,homeHint,stack([connect,homePause],horizontal:true)]),
+            label("这样开始",size:16,weight:.semibold),
+            label("1   在这台 Mac 复制\n      选中文字、截图或一个文件，按 ⌘ C",size:15),
+            label("2   等待上方显示「Windows 可粘贴」\n      大文件需要多等一会儿",size:15),
+            label("3   去 Windows 按 Ctrl + V\n      反过来也一样：Windows 复制，Mac 按 ⌘ V",size:15),
+            stack([files],horizontal:true),
+            label("关闭窗口后仍会同步。下次双击桌面的 CopyBridge 就能回来。\n刚连接或恢复同步时，请重新复制一次。",size:12,color:.secondaryLabelColor)
+        ])
+    }
+    @objc func openConnection() { tabs.selectedSegment = 1; selectTab() }
     func checkbox(_ key: String,_ title: String) -> NSButton {
         let b = NSButton(checkboxWithTitle:title,target:self,action:#selector(settingsEdited)); b.font = .systemFont(ofSize:13)
         b.setAccessibilityIdentifier("setting_" + key); controls[key] = b; return b
@@ -395,12 +533,21 @@ func snapshot(_ source: Source, id: String) throws -> Snapshot {
     }
     func principlesPage() -> NSView {
         let steps = [("1  正常复制","在正在使用的电脑按原来的复制快捷键。"),("2  加密直传","只发给已配对的设备，经局域网直接传输。"),("3  收齐并核对","文字、图片和文件完整收到后，才更新剪贴板。"),("4  正常粘贴","看到“可粘贴”后，在另一台电脑正常粘贴。")]
-        return page([label("它如何工作",size:20,weight:.semibold),card(steps.map { label($0.0 + "\n" + $0.1,size:13) }),label("不改快捷键，不自动发送消息，也不会打开收到的文件。\n复制了更新的内容时，旧传输会被放弃；恢复连接后请重新复制。",color:.secondaryLabelColor),label("单个文件上限 2 GiB，暂不支持文件夹和多文件批次。\n提前粘贴可能仍是旧内容；图片、视频能否插入取决于目标软件。",size:12,color:.secondaryLabelColor)])
+        return page([label("重启电脑后怎么开始",size:20,weight:.semibold),label("在 Mac 和 Windows 各双击桌面的 CopyBridge。\n程序会沿用原配对尝试连接，连上后请重新复制一次。\n关闭窗口仍会同步，菜单中选择「退出」才会停止。",color:.secondaryLabelColor),card(steps.map { label($0.0 + "\n" + $0.1,size:13) }),label("不改快捷键，不自动发送消息，也不会打开收到的文件。\n复制了更新的内容时，旧传输会被放弃。",color:.secondaryLabelColor),label("单个文件上限 2 GiB，暂不支持文件夹和多文件批次。\n提前粘贴可能仍是旧内容；图片、视频能否插入取决于目标软件。",size:12,color:.secondaryLabelColor)])
     }
     func show() { window.makeKeyAndOrderFront(nil); NSApplication.shared.activate(ignoringOtherApps:true); updateStatus() }
-    @objc func selectTab() { for (index,page) in pages.enumerated() { page.isHidden = index != tabs.selectedSegment }; if tabs.selectedSegment == 1 { updateSettings() } }
+    @objc func selectTab() { for (index,page) in pages.enumerated() { page.isHidden = index != tabs.selectedSegment }; if tabs.selectedSegment == 2 { updateSettings() } }
     func controlTextDidChange(_ notification: Notification) {
-        pendingInvite = nil; connectButton.isEnabled = false; previewInfo.stringValue = "配对码已更改，请重新预览设备。"; pairingFeedback.stringValue = ""
+        previewInvitation()
+    }
+    @objc func pasteInvitation() { readInvitation(from:.general) }
+    func readInvitation(from board: NSPasteboard) {
+        guard let text = board.string(forType:.string), !text.trimmingCharacters(in:.whitespacesAndNewlines).isEmpty else {
+            pendingInvite = nil; legacyConnectButton.isEnabled = false; invitationField.stringValue = ""
+            previewInfo.stringValue = "还没有复制到配对码"; pairingFeedback.stringValue = "先在这台 Mac 复制完整配对码，再点「粘贴配对码」。"; return
+        }
+        invitationField.stringValue = text
+        previewInvitation()
     }
     @objc func importInvitation() {
         let panel = NSOpenPanel(); panel.title = "选择 Windows 导出的配对文件"; panel.canChooseDirectories = false; panel.allowsMultipleSelection = false
@@ -408,32 +555,49 @@ func snapshot(_ source: Source, id: String) throws -> Snapshot {
             guard let self, response == .OK, let url = panel.url else { return }
             do {
                 let text = try invitationText(at:url); self.invitationField.stringValue = text; self.previewInvitation()
-            } catch { self.pendingInvite = nil; self.connectButton.isEnabled = false; self.pairingFeedback.stringValue = friendlyError(error) }
+            } catch { self.pendingInvite = nil; self.legacyConnectButton.isEnabled = false; self.pairingFeedback.stringValue = friendlyError(error) }
         }
     }
     @objc func previewInvitation() {
+        pendingInvite = nil; legacyConnectButton.isEnabled = false
+        let text = invitationField.stringValue
+        if text.trimmingCharacters(in:.whitespacesAndNewlines).isEmpty {
+            previewInfo.stringValue = "等待粘贴配对码"; pairingFeedback.stringValue = "点击「粘贴配对码」，或在输入框按 ⌘V。"; return
+        }
         do {
-            let invite = try Invitation.decode(invitationField.stringValue); pendingInvite = invite
-            previewInfo.stringValue = "设备：\(invite.deviceName)\n地址：\(invite.url)\n有效期至：\(invite.expiresAt)"
-            pairingFeedback.stringValue = "请确认这是你要连接的 Windows。"; connectButton.isEnabled = true
-        } catch { pendingInvite = nil; connectButton.isEnabled = false; previewInfo.stringValue = "配对码尚未通过验证。"; pairingFeedback.stringValue = friendlyError(error) }
+            let invite = try Invitation.decode(text); pendingInvite = invite
+            previewInfo.stringValue = "找到电脑：\(invite.deviceName)\n是你的电脑，就点下面的连接按钮。"
+            pairingFeedback.stringValue = "已完整读取配对码（\(text.count) 个字符）。"; legacyConnectButton.isEnabled = true
+        } catch {
+            previewInfo.stringValue = "已收到 \(text.count) 个字符"
+            switch errorCode(error) {
+            case "INVITATION_EXPIRED_OR_INVALID_TIME": pairingFeedback.stringValue = "配对码已过期，请在 Windows 刷新后重新复制。"
+            case "INVITATION_SIZE_LIMIT": pairingFeedback.stringValue = "复制的内容太长，请只复制 COPYBRIDGE1: 开头的配对码。"
+            default: pairingFeedback.stringValue = "这不是完整配对码，请重新复制 COPYBRIDGE1: 开头的整段内容。"
+            }
+        }
     }
     @objc func connectInvitation() {
         guard let invite = pendingInvite else { return }
         Task { await app.pair(invite) }
     }
-    func pairingBusy(_ busy: Bool) { invitationField.isEnabled = !busy; importButton.isEnabled = !busy; previewButton.isEnabled = !busy; connectButton.isEnabled = !busy && pendingInvite != nil }
+    func pairingBusy(_ busy: Bool) { addressField.isEnabled = !busy; quickCodeField.isEnabled = !busy; connectButton.isEnabled = !busy; invitationField.isEnabled = !busy; importButton.isEnabled = !busy; pasteButton.isEnabled = !busy; legacyConnectButton.isEnabled = !busy && pendingInvite != nil }
     func pairingFinished(_ error: Error?) {
         pairingBusy(false)
         if let error { pairingFeedback.stringValue = friendlyError(error) + "；原来的本机连接配置已保留。" }
-        else { invitationField.stringValue = ""; pendingInvite = nil; connectButton.isEnabled = false; pairingFeedback.stringValue = "配对成功。现在可以复制新内容。"; updateStatus(); updateSettings(force:true) }
+        else { quickCodeField.stringValue = ""; invitationField.stringValue = ""; pendingInvite = nil; legacyConnectButton.isEnabled = false; pairingFeedback.stringValue = "配对成功。现在可以复制新内容。"; tabs.selectedSegment = 0; selectTab(); updateStatus(); updateSettings(force:true) }
     }
     func updateStatus() {
         liveStatus.stringValue = app.stateText + "  ·  局域网直连"
+        homeDevice.stringValue = "这台 Mac  ↔  " + (app.config?.deviceName ?? "等待连接 Windows")
+        homeHint.stringValue = app.config == nil ? "先点「查看连接设备」，按提示连接你的 Windows。" : app.paused ? "同步已暂停。点「恢复同步」后，重新复制需要的内容。" : app.epoch == nil ? "正在等待 Windows。请确认两端都已打开，并连接同一网络。" : "两台设备已连接。现在可以复制新内容，按下面三步试一试。"
+        homePause.title = app.paused ? "恢复同步" : "暂停同步"
+        homePause.isEnabled = app.settings != nil && !app.savingSettings
         if let c = app.config { connectionInfo.stringValue = "\(app.settings == nil ? "上次设备" : "当前设备")：\(c.deviceName ?? "Windows")  ·  \(c.url)" }
         else { connectionInfo.stringValue = "本机 Mac 尚未连接 Windows。关闭此窗口后，CopyBridge 仍在菜单栏。" }
     }
     func updateSettings(force: Bool = false) {
+        updateStatus()
         let s = app.settings
         for control in controls.values { control.isEnabled = s != nil && !app.savingSettings }
         saveButton.isEnabled = s != nil && !app.savingSettings
@@ -497,6 +661,7 @@ func friendlyError(_ error: Error) -> String {
     func status(_ text: String) {
         var display = text
         if text.contains("SESSION_LOCKED") { display = "Windows 已锁定，请解锁后重新复制" }
+        else if text.contains("LOCAL_CLIPBOARD_CHANGED") || text.contains("SUPERSEDED") { display = "复制内容已更新，请以最新一次为准" }
         else if text.contains("TYPE_DISABLED") { display = "本次内容已关闭同步，可在设置中修改" }
         else if text.contains("PAIRING_REQUIRED") || text.contains("AUTH_FAILED") { display = "请生成新配对码，连接 Windows" }
         else if text.contains("NETWORK_FAILED") { display = "未连接，请检查两台电脑的局域网" }
@@ -504,6 +669,7 @@ func friendlyError(_ error: Error) -> String {
         stateText = display; statusRow?.title = display; statusItem?.button?.title = paused ? "CopyBridge ⏸" : "CopyBridge ↔"; settingsWindow?.updateStatus()
     }
     func applicationDidFinishLaunching(_ notification: Notification) {
+        installApplicationMenu()
         menu()
         do {
             try FileManager.default.createDirectory(at:support,withIntermediateDirectories:true,attributes:[.posixPermissions:0o700])
@@ -520,17 +686,28 @@ func friendlyError(_ error: Error) -> String {
             }
             if config == nil { status("尚未连接设备"); showSettings() }
             else if config.formatVersion != 2 && option("--pair-token-file") == nil { status("请导入新配对码，保留原有连接凭据"); showSettings() }
-            else if CommandLine.arguments.contains("--show-settings") { showSettings() }
+            else if !CommandLine.arguments.contains("--background") || CommandLine.arguments.contains("--show-settings") { showSettings() }
         } catch { status("连接配置暂不可用，请重新配对"); log("CONFIG_FAILED"); showSettings() }
     }
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
     func applicationShouldHandleReopen(_ sender: NSApplication,hasVisibleWindows flag: Bool) -> Bool { showSettings(); return false }
+    func installApplicationMenu() {
+        let main = NSMenu()
+        let applicationItem = NSMenuItem(); let applicationMenu = NSMenu(title:"CopyBridge")
+        applicationMenu.addItem(withTitle:"退出 CopyBridge",action:#selector(quit),keyEquivalent:"q").target = self
+        applicationItem.submenu = applicationMenu; main.addItem(applicationItem)
+        let editItem = NSMenuItem(); let edit = NSMenu(title:"编辑")
+        for (title,action,key) in [("撤销","undo:","z"),("剪切","cut:","x"),("复制","copy:","c"),("粘贴","paste:","v"),("全选","selectAll:","a")] {
+            edit.addItem(withTitle:title,action:Selector(action),keyEquivalent:key)
+        }
+        editItem.submenu = edit; main.addItem(editItem); NSApplication.shared.mainMenu = main
+    }
     func menu() {
         guard statusItem == nil else { return }
         statusItem = NSStatusBar.system.statusItem(withLength:NSStatusItem.variableLength); statusItem.button?.title = "CopyBridge ↔"
         let menu = NSMenu(); menu.autoenablesItems = false; statusRow = NSMenuItem(title:stateText,action:nil,keyEquivalent:""); menu.addItem(statusRow)
         menu.addItem(NSMenuItem(title:"Mac ⇄ Windows · 局域网直连",action:nil,keyEquivalent:"")); menu.addItem(.separator())
-        let openSettings = NSMenuItem(title:"打开设置…",action:#selector(showSettings),keyEquivalent:","); openSettings.target = self; menu.addItem(openSettings)
+        let openSettings = NSMenuItem(title:"打开 CopyBridge…",action:#selector(showSettings),keyEquivalent:","); openSettings.target = self; menu.addItem(openSettings)
         pauseRow = NSMenuItem(title:"暂停同步",action:#selector(togglePause),keyEquivalent:""); pauseRow.target = self; pauseRow.isEnabled = false; menu.addItem(pauseRow)
         for (title,action) in [("打开收到的文件",#selector(openReceived)),("取消当前传输",#selector(cancelCurrent)),("解除配对",#selector(unpair)),("退出",#selector(quit))] {
             let item = NSMenuItem(title:title,action:action,keyEquivalent:""); item.target = self; menu.addItem(item)
@@ -539,7 +716,7 @@ func friendlyError(_ error: Error) -> String {
     }
     @objc func showSettings() { if settingsWindow == nil { settingsWindow = SettingsWindow(app:self) }; settingsWindow?.show() }
     @objc func openReceived() { NSWorkspace.shared.open(received) }
-    @objc func quit() { cancelWork(); loopTask?.cancel(); net?.cancelAll(); NSApplication.shared.terminate(nil) }
+    @objc func quit() { settingsWindow?.quickTask?.cancel(); cancelWork(); loopTask?.cancel(); net?.cancelAll(); NSApplication.shared.terminate(nil) }
     @objc func cancelCurrent() { cancelWork(); status("已取消，请重新复制") }
     func cancelWork() {
         if let id = incomingID { reverseDiscard.insert(id) }; incomingID = nil
@@ -941,6 +1118,36 @@ if let path = option("--spool-test") {
         print(String(decoding:json,as:UTF8.self))
     } catch { fputs("Spool test failed: \(errorCode(error))\n",stderr); exit(1) }
     exit(0)
+}
+if let fixturePath = option("--quick-pair-test-fixture") {
+    MainActor.assumeIsolated {
+        do {
+            struct Fixture: Decodable { let address: String; let code: String; let packet: QuickEnvelope; let invitation: String }
+            let value = try JSONDecoder().decode(Fixture.self,from:Data(contentsOf:URL(fileURLWithPath:fixturePath)))
+            let packet = try JSONEncoder().encode(value.packet)
+            _ = try QuickPair.open(packet,code:value.code,origin:value.address)
+            let wrong = String(repeating:value.code.first == "A" ? "B" : "A",count:20)
+            do { _ = try QuickPair.open(packet,code:wrong,origin:value.address); throw BridgeError("SELFTEST_WRONG_CODE_ACCEPTED") }
+            catch { guard errorCode(error) == "QUICK_CODE_WRONG" else { throw error } }
+            do { _ = try QuickPair.open(packet,code:value.code,origin:"127.0.0.2:43863"); throw BridgeError("SELFTEST_WRONG_ADDRESS_ACCEPTED") }
+            catch { guard errorCode(error) == "QUICK_ADDRESS_MISMATCH" else { throw error } }
+            let app = App(); app.installApplicationMenu(); let view = SettingsWindow(app:app)
+            let board = NSPasteboard.withUniqueName(); defer { board.releaseGlobally() }
+            board.setString(value.address + " " + value.code,forType:.string); view.readQuickConnection(from:board)
+            guard view.addressField.stringValue == value.address,view.quickCodeField.stringValue == value.code else { throw BridgeError("SELFTEST_QUICK_PASTE") }
+            board.clearContents();board.setString("bad",forType:.string);view.readQuickConnection(from:board)
+            guard view.quickCodeField.stringValue.isEmpty else { throw BridgeError("SELFTEST_STALE_CODE") }
+            board.clearContents();board.setString(value.invitation,forType:.string);view.readInvitation(from:board)
+            guard view.invitationField.stringValue == value.invitation, view.pendingInvite != nil,view.legacyConnectButton.isEnabled else { throw BridgeError("SELFTEST_LONG_PASTE") }
+            let long = "COPYBRIDGE1:" + String(repeating:"A",count:16000)
+            board.clearContents();board.setString(long,forType:.string);view.readInvitation(from:board)
+            guard view.invitationField.stringValue.count == long.count,view.pendingInvite == nil,!view.legacyConnectButton.isEnabled else { throw BridgeError("SELFTEST_LONG_FIELD") }
+            let menu = NSApplication.shared.mainMenu!
+            guard menu.items.contains(where: { $0.submenu?.items.contains(where: { $0.keyEquivalent == "v" && $0.action == Selector(("paste:")) }) == true }) else { throw BridgeError("SELFTEST_PASTE_MENU") }
+            print("PASS: cross-platform authenticated short pairing; wrong-code/address rejection; short paste; stale-code clearing; full legacy paste; 16012-character field; standard paste menu")
+            exit(0)
+        } catch { fputs("Quick-pair test failed: \(errorCode(error))\n",stderr);exit(1) }
+    }
 }
 if CommandLine.arguments.contains("--self-test") {
     do { try selfTest(); exit(0) } catch { fputs("Self-test failed: \(errorCode(error))\n",stderr); exit(1) }

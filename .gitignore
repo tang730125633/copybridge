@@ -15,3 +15,9 @@ self-test-failure.txt
 
 # One-time device invitations contain pairing credentials.
 *.copybridge
+
+# Local runtime state and synthetic pairing-test output.
+/data/
+quick-pair-test-fixture.json
+*.pem
+*.jsonl

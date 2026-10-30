@@ -38,6 +38,10 @@ static class Program {
     static X509Certificate2 activeCertificate=null!;
     static SettingsWindow? settingsWindow;
     static string invitationCode="";
+    static string quickCode="";
+    static QuickEnvelope? quickEnvelope;
+    internal static string QuickAddress=>listenPort==43861?bindAddress:$"{bindAddress}:{listenPort}";
+    internal static string QuickCode=>InvitationAvailable?QuickPairing.Display(quickCode):"";
     static long lastPeerSeenTicks;
     internal static bool PeerRecentlySeen=>Interlocked.Read(ref lastPeerSeenTicks)>DateTime.UtcNow.AddSeconds(-5).Ticks;
     internal static string Origin=>$"https://{bindAddress}:{listenPort}";
@@ -89,7 +93,7 @@ static class Program {
             var timer=new DispatcherTimer {Interval=TimeSpan.FromMilliseconds(100)};timer.Tick+=(_,_)=>bridge.Observe();timer.Start();
             application.Exit+=(_,_)=>{launchWait.Unregister(null);timer.Stop();tray.Dispose();web.StopAsync().GetAwaiter().GetResult();};
             File.WriteAllText(Path.Combine(data,"runtime.json"),JsonSerializer.Serialize(new {pid=Environment.ProcessId,sessionId=System.Diagnostics.Process.GetCurrentProcess().SessionId,bind,port,startedAt=DateTimeOffset.UtcNow},Bridge.Json));
-            if(Identity.Token==null||args.Contains("--settings"))OpenSettings();
+            if(Identity.Token==null||!args.Contains("--background")||args.Contains("--settings"))OpenSettings();
             application.Run();return 0;
         } catch(Exception e) {File.WriteAllText(Path.Combine(data,"startup-error.txt"),e.GetType().Name+": "+e.Message);return 1;}
     }
@@ -116,6 +120,7 @@ static class Program {
     static void WritePairing(X509Certificate2 cert) {
         PairingInvite.WritePrivate(Path.Combine(data,"pairing.json"),JsonSerializer.Serialize(new{token=Identity.Bootstrap,expiresAt=Identity.Expires,deviceId=Identity.DeviceId,certificateSha256=Convert.ToHexString(SHA256.HashData(cert.RawData)).ToLowerInvariant()},Bridge.Json));
         invitationCode=PairingInvite.Encode(Origin,Identity,cert);PairingInvite.WritePrivate(InvitationPath,invitationCode);
+        quickCode=QuickPairing.FromBootstrap(Identity.Bootstrap);quickEnvelope=QuickPairing.Seal(invitationCode,quickCode);
     }
     static void RequireAuth(HttpContext context){string header=context.Request.Headers.Authorization.ToString();if(!header.StartsWith("Bearer ")||!Equal(Identity.Token,header[7..]))throw new Fault("AUTH_FAILED",401);Interlocked.Exchange(ref lastPeerSeenTicks,DateTime.UtcNow.Ticks);}
     static bool Equal(string? a,string? b)=>a!=null&&b!=null&&CryptographicOperations.FixedTimeEquals(Encoding.UTF8.GetBytes(a),Encoding.UTF8.GetBytes(b));
@@ -130,7 +135,7 @@ static class Program {
         var app=builder.Build();
         app.Use(async(c,next)=> {
             try {
-                if(c.Request.Path!="/v1/pair") {
+                if(c.Request.Path!="/v1/pair"&&!(HttpMethods.IsGet(c.Request.Method)&&c.Request.Path=="/v1/pairing/quick")) {
                     RequireAuth(c);
                     if(c.Request.Path!="/v1/hello"&&c.Request.Path!="/v1/pause"&&c.Request.Path!="/v1/unpair"&&c.Request.Path!="/v1/settings")await bridge.OnUI(()=>{bridge.CheckEpoch(c.Request.Headers["X-Connection-Epoch"].ToString());return true;});
                 }
@@ -142,6 +147,11 @@ static class Program {
                 await c.Response.WriteAsJsonAsync(new{error},Bridge.Json);
             }
         });
+        // Public bootstrap exposes only AEAD ciphertext; the short secret never crosses the network.
+        app.MapGet("/v1/pairing/quick",new Func<HttpContext,Task<IResult>>(async c=>Results.Json(await bridge.OnUI(()=>{
+            if(!InvitationAvailable||quickEnvelope==null)throw new Fault("INVITATION_UNAVAILABLE",409);
+            c.Response.Headers.CacheControl="no-store";return quickEnvelope;
+        }),Bridge.Json)));
         app.MapPost("/v1/pair",async(HttpContext c)=> {
             var request=await Body<PairRequest>(c);
             return Results.Json(await bridge.OnUI(()=>{
@@ -149,7 +159,7 @@ static class Program {
                 if(++pairAttempts>5)throw new Fault("RATE_LIMIT",429);
                 Bridge.Uuid(request.DeviceId);if(Identity.Token!=null||DateTimeOffset.UtcNow>Identity.Expires||!Equal(Identity.Bootstrap,request.Token))throw new Fault("AUTH_FAILED",401);
                 var paired=new Identity{DeviceId=Identity.DeviceId,Peer=request.DeviceId,Token=Convert.ToHexString(RandomNumberGenerator.GetBytes(32)).ToLowerInvariant(),Bootstrap="",Expires=Identity.Expires};
-                SaveIdentity(paired);Identity=paired;invitationCode="";File.Delete(Path.Combine(data,"pairing.json"));File.Delete(InvitationPath);bridge.Notify("Mac 已配对，正在连接");
+                SaveIdentity(paired);Identity=paired;invitationCode="";quickCode="";quickEnvelope=null;File.Delete(Path.Combine(data,"pairing.json"));File.Delete(InvitationPath);bridge.Notify("Mac 已配对，正在连接");
                 return new{token=Identity.Token,deviceId=Identity.DeviceId};
             }),Bridge.Json);
         });
@@ -214,18 +224,39 @@ static class Program {
     internal static void DisconnectPeer(){GenerateInvitation();bridge.Notify("已断开设备，可重新配对");}
     internal static void CopyInvitation() {
         if(!InvitationAvailable)throw new Fault("INVITATION_UNAVAILABLE");
-        var formats=new Dictionary<uint,byte[]> {{NativeClipboard.Marker,Encoding.UTF8.GetBytes(Guid.NewGuid().ToString()+"\0")},{NativeClipboard.Sensitive,new byte[]{1}},{NativeClipboard.ExcludeHistory,new byte[]{1}},{13,Encoding.Unicode.GetBytes(invitationCode+"\0")}};
+        CopyPairingText(invitationCode);
+    }
+    internal static void CopyQuickConnection() {
+        if(!InvitationAvailable){if(Identity.Token!=null)throw new Fault("INVITATION_UNAVAILABLE");GenerateInvitation();}
+        CopyPairingText(QuickAddress+" "+QuickCode);
+    }
+    static void CopyPairingText(string text) {
+        var formats=new Dictionary<uint,byte[]> {{NativeClipboard.Marker,Encoding.UTF8.GetBytes(Guid.NewGuid().ToString()+"\0")},{NativeClipboard.Sensitive,new byte[]{1}},{NativeClipboard.ExcludeHistory,new byte[]{1}},{13,Encoding.Unicode.GetBytes(text+"\0")}};
         if(!NativeClipboard.Publish(formats,()=>{if(!InvitationAvailable)throw new Fault("INVITATION_UNAVAILABLE");},out _))throw new Fault("CLIPBOARD_BUSY");
     }
     internal static void ExportInvitation(string path){if(!InvitationAvailable)throw new Fault("INVITATION_UNAVAILABLE");PairingInvite.WritePrivate(path,invitationCode);}
     internal static void OpenReceived()=>Process.Start(new ProcessStartInfo("explorer.exe",bridge.Received){UseShellExecute=true});
+    internal static void CreateDesktopShortcut() {
+        string path=Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory),"CopyBridge.lnk");
+        // A final dot keeps a trailing directory slash from escaping the closing quote.
+        string arguments=$"--bind {bindAddress} --port {listenPort} --data \"{Path.Combine(data,".")}\" --settings";
+        WriteShortcut(path,Environment.ProcessPath!,arguments);
+    }
+    static void WriteShortcut(string path,string executable,string arguments) {
+        dynamic shell=Activator.CreateInstance(Type.GetTypeFromProgID("WScript.Shell")!)!;
+        object? shortcut=null;
+        string icon=Path.Combine(Path.GetDirectoryName(executable)!,"CopyBridge.ico");
+        try {dynamic link=shell.CreateShortcut(path);shortcut=link;link.TargetPath=executable;link.Arguments=arguments;link.WorkingDirectory=Path.GetDirectoryName(executable);link.IconLocation=File.Exists(icon)?icon:executable+",0";link.Description="CopyBridge";link.Save();}
+        finally {if(shortcut!=null)Marshal.FinalReleaseComObject(shortcut);Marshal.FinalReleaseComObject(shell);}
+    }
     static void OpenSettings(){if(settingsWindow==null){settingsWindow=new SettingsWindow(bridge);settingsWindow.Closed+=(_,_)=>settingsWindow=null;}settingsWindow.Show();if(settingsWindow.WindowState==WindowState.Minimized)settingsWindow.WindowState=WindowState.Normal;settingsWindow.Activate();}
     static void BuildTray(System.Windows.Application application) {
-        var menu=new Forms.ContextMenuStrip();menu.Items.Add("打开设置",null,(_,_)=>OpenSettings());var status=new Forms.ToolStripMenuItem(bridge.Status){Enabled=false};menu.Items.Add(status);
+        var menu=new Forms.ContextMenuStrip();menu.Items.Add("打开 CopyBridge",null,(_,_)=>OpenSettings());var status=new Forms.ToolStripMenuItem(bridge.Status){Enabled=false};menu.Items.Add(status);
         var pause=new Forms.ToolStripMenuItem("暂停同步");pause.Click+=(_,_)=>{try{bridge.Pause(!bridge.Paused);}catch{Forms.MessageBox.Show("设置未能保存，请检查本机文件权限或可用空间。","CopyBridge");}};menu.Items.Add(pause);
         menu.Items.Add("打开接收文件夹",null,(_,_)=>OpenReceived());
         menu.Items.Add("连接设备",null,(_,_)=>OpenSettings());menu.Items.Add("退出",null,(_,_)=>application.Shutdown());
-        tray=new Forms.NotifyIcon {Icon=System.Drawing.SystemIcons.Application,Text="CopyBridge：未连接",ContextMenuStrip=menu,Visible=true};
+        tray=new Forms.NotifyIcon {Icon=System.Drawing.Icon.ExtractAssociatedIcon(Environment.ProcessPath!)??(System.Drawing.Icon)System.Drawing.SystemIcons.Application.Clone(),Text="CopyBridge：未连接",ContextMenuStrip=menu,Visible=true};
+        application.Exit+=(_,_)=>tray.Icon?.Dispose();
         tray.DoubleClick+=(_,_)=>OpenSettings();
         bridge.Changed+=()=>{pause.Text=bridge.Paused?"恢复同步":"暂停同步";status.Text=bridge.Status;tray.Text=("CopyBridge："+bridge.Status)[..Math.Min(63,("CopyBridge："+bridge.Status).Length)];try{File.WriteAllText(Path.Combine(data,"status.json"),JsonSerializer.Serialize(new{status=bridge.Status,paused=bridge.Paused,generation=bridge.Generation,sequence=bridge.Sequence,connected=bridge.Epoch!="",settingsRevision=bridge.Settings.Current.Revision,updatedAt=DateTimeOffset.UtcNow},Bridge.Json));}catch(IOException){}};
     }
@@ -244,7 +275,16 @@ static class Program {
         }finally{Directory.Delete(directory,true);}
     }
     static void SelfTest() {
-        SettingsStore.SelfTest();PairingInvite.SelfTest();SingleInstanceSelfTest();
+        SettingsStore.SelfTest();PairingInvite.SelfTest();QuickPairing.SelfTest();SingleInstanceSelfTest();
+        string shortcutDirectory=Path.Combine(Path.GetTempPath(),"CopyBridge shortcut "+Guid.NewGuid().ToString("N"));Directory.CreateDirectory(shortcutDirectory);
+        try {
+            string shortcutPath=Path.Combine(shortcutDirectory,"CopyBridge.lnk");
+            string expected=$"--data \"{Path.Combine(shortcutDirectory,".")}\" --settings";
+            WriteShortcut(shortcutPath,Environment.ProcessPath!,expected);
+            dynamic shell=Activator.CreateInstance(Type.GetTypeFromProgID("WScript.Shell")!)!;dynamic link=shell.CreateShortcut(shortcutPath);
+            try {if((string)link.Arguments!=expected||!string.Equals((string)link.TargetPath,Environment.ProcessPath,StringComparison.OrdinalIgnoreCase))throw new Exception("Desktop shortcut round-trip failed");}
+            finally {Marshal.FinalReleaseComObject(link);Marshal.FinalReleaseComObject(shell);}
+        } finally {Directory.Delete(shortcutDirectory,true);}
         void Check(bool ok){if(!ok)throw new Exception("assertion failed");}
         foreach(var name in new[]{"../a","C:\\a","NUL.txt","a:ads","a.","a/1","CON","COM¹.txt","LPT²"}) {try{Bridge.ValidateName(name);throw new Exception("accepted bad name");}catch(Fault f){Check(f.Message=="INVALID_FILENAME");}}
         Bridge.ValidateName("图片 测试.png");

@@ -2,7 +2,9 @@
 set -eu
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
 APP="${1:-$ROOT/build/macos/CopyBridge.app}"
-mkdir -p "$APP/Contents/MacOS"
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+cp "$ROOT/assets/icon/CopyBridge.icns" "$APP/Contents/Resources/AppIcon.icns"
+cp "$ROOT/assets/icon/CopyBridge-256.png" "$APP/Contents/Resources/AppIcon.png"
 swiftc -swift-version 5 -O -framework AppKit -framework CryptoKit -framework Security -framework ImageIO -framework UniformTypeIdentifiers "$ROOT/apps/macos/CopyBridge.swift" -o "$APP/Contents/MacOS/CopyBridge"
 cat > "$APP/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
@@ -12,8 +14,9 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 <key>CFBundleName</key><string>CopyBridge</string>
 <key>CFBundleExecutable</key><string>CopyBridge</string>
 <key>CFBundlePackageType</key><string>APPL</string>
-<key>CFBundleShortVersionString</key><string>0.2.0</string>
-<key>CFBundleVersion</key><string>2</string>
+<key>CFBundleIconFile</key><string>AppIcon.icns</string>
+<key>CFBundleShortVersionString</key><string>0.3.2</string>
+<key>CFBundleVersion</key><string>5</string>
 <key>LSUIElement</key><true/>
 <key>LSMinimumSystemVersion</key><string>14.0</string>
 <key>NSAppTransportSecurity</key><dict><key>NSAllowsLocalNetworking</key><true/></dict>

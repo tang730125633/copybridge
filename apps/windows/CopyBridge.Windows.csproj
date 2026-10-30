@@ -3,7 +3,13 @@
     <OutputType>WinExe</OutputType><TargetFramework>net10.0-windows</TargetFramework>
     <UseWPF>true</UseWPF><UseWindowsForms>true</UseWindowsForms><Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings><EnableDefaultApplicationDefinition>false</EnableDefaultApplicationDefinition>
-    <AssemblyName>CopyBridge</AssemblyName><Version>0.2.0</Version>
+    <AssemblyName>CopyBridge</AssemblyName><Version>0.4.2</Version>
+    <ApplicationIcon>../../assets/icon/CopyBridge.ico</ApplicationIcon>
   </PropertyGroup>
   <ItemGroup><FrameworkReference Include="Microsoft.AspNetCore.App" /></ItemGroup>
+  <ItemGroup>
+    <Resource Include="../../assets/icon/CopyBridge.ico" Link="AppIcon.ico" />
+    <Resource Include="../../assets/icon/CopyBridge-256.png" Link="AppIcon.png" />
+    <Content Include="../../assets/icon/CopyBridge.ico" Link="CopyBridge.ico" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+  </ItemGroup>
 </Project>
