@@ -40,6 +40,9 @@ CopyBridge 把这件事接起来
 
 连接信息十分钟有效，成功使用一次即失效
 重启后双击两端桌面图标，程序沿用原配对尝试连接
+Mac 可通过已配对的 Windows 设备名查找变化后的局域网地址
+连接仍会核对原来的设备证书，不会因地址变化接受另一台电脑
+需要同一局域网的设备名称发现可用，且防火墙允许两端通信
 
 Mac 用 **Command+C / Command+V**<br>
 Windows 用 **Ctrl+C / Ctrl+V**
@@ -113,6 +116,8 @@ Windows 原生窗口的逐项点击仍待本机验收<br>
 构建后，在两端设置窗口完成配对
 首次连接不需要手写配置文件
 当前没有通用的一键安装包
+Windows 的 `scripts/windows/launch-watch.ps1` 可在交互式登录会话中监测地址并重启客户端
+它需要部署者提供程序和数据目录，并配置登录启动及防火墙；不会由构建命令自动安装
 
 Mac 需要 Apple Silicon 与 Swift 命令行工具（实测 macOS 26.0.1）
 Windows 需要 Windows 桌面环境与 .NET 10 SDK

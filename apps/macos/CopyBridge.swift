@@ -205,6 +205,21 @@ final class Network {
     var token = ""
     private(set) var publicKeyPin = ""
     let jobsLock = NSLock(); var jobs: [UUID:CurlJob] = [:]
+    private let addressLock = NSLock()
+    private var addressChecked = Date.distantPast
+    private var discoveredAddress: String?
+    // The original URL remains the TLS identity; discovery changes only the TCP destination.
+    private func localDestination() -> String? {
+        guard config.formatVersion == 2, let name = config.deviceName,
+              name.range(of: "^[A-Za-z0-9-]{1,63}$", options: .regularExpression) != nil else { return nil }
+        addressLock.lock(); defer { addressLock.unlock() }
+        if Date().timeIntervalSince(addressChecked) < 5 { return discoveredAddress }
+        addressChecked = Date()
+        discoveredAddress = Host(name: name + ".local").addresses.first { address in
+            privateOrigin("https://\(address):43861") && !address.hasPrefix("127.")
+        }
+        return discoveredAddress
+    }
     init(_ config: Config, certificateURL: URL? = nil) throws {
         guard let url = URL(string:config.url), url.scheme == "https", url.host != nil, url.user == nil, url.password == nil, url.query == nil, url.fragment == nil,
               UUID(uuidString:config.deviceId) != nil, config.certificateSha256.count == 64,
@@ -242,6 +257,10 @@ final class Network {
         let fm = FileManager.default
         guard fm.createFile(atPath:output.path,contents:nil,attributes:[.posixPermissions:0o600]) else { throw BridgeError("LOCAL_IO_FAILED") }
         var options = [("url",config.url + path),("request",method),("cacert",ca.path),("pinnedpubkey",publicKeyPin),("noproxy","*"),("proto","=https"),("max-redirs","0"),("connect-timeout","5"),("max-time","3600"),("speed-time","60"),("speed-limit","1"),("max-filesize",String(max(1,limit))),("output",output.path),("write-out","%{http_code}"),("header","Authorization: Bearer " + token)]
+        if let destination = localDestination(), let url = URLComponents(string: config.url), let host = url.host {
+            let port = url.port ?? 443
+            options.append(("connect-to", "\(host):\(port):\(destination):\(port)"))
+        }
         if let epoch { options.append(("header","X-Connection-Epoch: " + epoch)) }
         if let body { guard body.count <= 65536, let text = String(data:body,encoding:.utf8) else { throw BridgeError("REQUEST_SIZE_LIMIT") }; options.append(("header","Content-Type: application/json")); options.append(("data-binary",text)) }
         if let upload { options.append(("header","Content-Type: application/octet-stream")); options.append(("upload-file",upload.path)) }
