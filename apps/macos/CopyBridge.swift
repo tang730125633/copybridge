@@ -215,8 +215,23 @@ final class Network {
         addressLock.lock(); defer { addressLock.unlock() }
         if Date().timeIntervalSince(addressChecked) < 5 { return discoveredAddress }
         addressChecked = Date()
-        discoveredAddress = Host(name: name + ".local").addresses.first { address in
-            privateOrigin("https://\(address):43861") && !address.hasPrefix("127.")
+        // Restrict resolution to IPv4: Foundation Host also performs slow reverse lookups.
+        var hints = addrinfo(); hints.ai_family = AF_INET
+        var results: UnsafeMutablePointer<addrinfo>?
+        discoveredAddress = nil
+        if getaddrinfo(name + ".local", nil, &hints, &results) == 0, let first = results {
+            defer { freeaddrinfo(first) }
+            var current: UnsafeMutablePointer<addrinfo>? = first
+            while let entry = current {
+                var buffer = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+                if getnameinfo(entry.pointee.ai_addr, entry.pointee.ai_addrlen, &buffer, socklen_t(buffer.count), nil, 0, NI_NUMERICHOST) == 0 {
+                    let address = String(cString: buffer)
+                    if privateOrigin("https://\(address):43861") && !address.hasPrefix("127.") {
+                        discoveredAddress = address; break
+                    }
+                }
+                current = entry.pointee.ai_next
+            }
         }
         return discoveredAddress
     }
