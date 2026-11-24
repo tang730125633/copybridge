@@ -51,6 +51,8 @@ static class Program {
     static Forms.NotifyIcon tray=null!;
     static WebApplication web=null!;
     static int pairAttempts; static DateTimeOffset pairWindow=DateTimeOffset.UtcNow;
+    static FourDigitSession? fourDigitSession;
+    static int fourDigitAttempts; static DateTimeOffset fourDigitWindow=DateTimeOffset.UtcNow;
     static bool AtCheckpoint(ref long next,long count){if(count<next)return false;next=count+4*1024*1024;return true;}
     [DllImport("user32.dll")] static extern bool AllowSetForegroundWindow(uint processId);
     static string InstanceKey(string directory)=>Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(Path.GetFullPath(directory).TrimEnd(Path.DirectorySeparatorChar).ToUpperInvariant())))[..20];
@@ -135,7 +137,7 @@ static class Program {
         var app=builder.Build();
         app.Use(async(c,next)=> {
             try {
-                if(c.Request.Path!="/v1/pair"&&!(HttpMethods.IsGet(c.Request.Method)&&c.Request.Path=="/v1/pairing/quick")) {
+                if(c.Request.Path!="/v1/pair"&&!(HttpMethods.IsGet(c.Request.Method)&&c.Request.Path=="/v1/pairing/quick")&&c.Request.Path!="/v2/pair/start"&&c.Request.Path!="/v2/pair/status") {
                     RequireAuth(c);
                     if(c.Request.Path!="/v1/hello"&&c.Request.Path!="/v1/pause"&&c.Request.Path!="/v1/unpair"&&c.Request.Path!="/v1/settings")await bridge.OnUI(()=>{bridge.CheckEpoch(c.Request.Headers["X-Connection-Epoch"].ToString());return true;});
                 }
@@ -147,6 +149,33 @@ static class Program {
                 await c.Response.WriteAsJsonAsync(new{error},Bridge.Json);
             }
         });
+        app.MapPost("/v2/pair/start",async(HttpContext c)=> {
+            var request=await Body<FourDigitRequest>(c);
+            return Results.Json(await bridge.OnUI(()=> {
+                if(!InvitationAvailable)throw new Fault("INVITATION_UNAVAILABLE",409);
+                if(DateTimeOffset.UtcNow-fourDigitWindow>TimeSpan.FromMinutes(1)){fourDigitWindow=DateTimeOffset.UtcNow;fourDigitAttempts=0;}
+                if(++fourDigitAttempts>5)throw new Fault("RATE_LIMIT",429);
+                if(fourDigitSession!=null&&fourDigitSession.Expires>DateTimeOffset.UtcNow)throw new Fault("PAIRING_IN_PROGRESS",409);
+                var (session,publicKey)=FourDigitPairing.Create(request.PublicKey,invitationCode);
+                if(session.Expires>Identity.Expires)session.Expires=Identity.Expires;
+                fourDigitSession=session;
+                System.Windows.Application.Current.Dispatcher.BeginInvoke(new Action(()=> {
+                    OpenSettings();settingsWindow!.ShowFourDigitPrompt(session.Code,session.Expires,approved=> {
+                        if(fourDigitSession==session&&session.Expires>DateTimeOffset.UtcNow&&InvitationAvailable) {
+                            if(approved)session.Approved=true;else fourDigitSession=null;
+                        }
+                    });
+                }));
+                return new FourDigitStart(session.Id,publicKey);
+            }),Bridge.Json);
+        });
+        app.MapGet("/v2/pair/status",new Func<HttpContext,Task<IResult>>(async c=>Results.Json(await bridge.OnUI(()=> {
+            var s=fourDigitSession;string id=c.Request.Query["id"].ToString();
+            if(s==null)throw new Fault("PAIRING_EXPIRED",409);
+            var result=s.Poll(id,InvitationAvailable,DateTimeOffset.UtcNow);
+            if(result.state=="approved")fourDigitSession=null;
+            return new {result.state,result.sealedValue};
+        }),Bridge.Json)));
         // Public bootstrap exposes only AEAD ciphertext; the short secret never crosses the network.
         app.MapGet("/v1/pairing/quick",new Func<HttpContext,Task<IResult>>(async c=>Results.Json(await bridge.OnUI(()=>{
             if(!InvitationAvailable||quickEnvelope==null)throw new Fault("INVITATION_UNAVAILABLE",409);
@@ -219,7 +248,7 @@ static class Program {
     }
     internal static void GenerateInvitation() {
         if(!activeCertificate.MatchesHostname(bindAddress,false,false))throw new Fault("ADDRESS_CERTIFICATE_MISMATCH");
-        var replacement=new Identity{DeviceId=Identity.DeviceId};SaveIdentity(replacement);Identity=replacement;bridge.Revoke();WritePairing(activeCertificate);bridge.Notify("邀请已准备，请在 Mac 确认连接");
+        fourDigitSession=null;var replacement=new Identity{DeviceId=Identity.DeviceId};SaveIdentity(replacement);Identity=replacement;bridge.Revoke();WritePairing(activeCertificate);bridge.Notify("邀请已准备，请在 Mac 确认连接");
     }
     internal static void DisconnectPeer(){GenerateInvitation();bridge.Notify("已断开设备，可重新配对");}
     internal static void CopyInvitation() {
@@ -275,7 +304,7 @@ static class Program {
         }finally{Directory.Delete(directory,true);}
     }
     static void SelfTest() {
-        SettingsStore.SelfTest();PairingInvite.SelfTest();QuickPairing.SelfTest();SingleInstanceSelfTest();
+        SettingsStore.SelfTest();PairingInvite.SelfTest();QuickPairing.SelfTest();FourDigitPairing.SelfTest();SingleInstanceSelfTest();
         string shortcutDirectory=Path.Combine(Path.GetTempPath(),"CopyBridge shortcut "+Guid.NewGuid().ToString("N"));Directory.CreateDirectory(shortcutDirectory);
         try {
             string shortcutPath=Path.Combine(shortcutDirectory,"CopyBridge.lnk");

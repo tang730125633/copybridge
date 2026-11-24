@@ -99,6 +99,37 @@ func invitationText(at url: URL) throws -> String {
     return text
 }
 struct QuickEnvelope: Codable { let version: Int; let sealed: String }
+struct FourDigitStart: Decodable { let id:String; let publicKey:String }
+struct FourDigitStatus: Decodable { let state:String; let sealedValue:String }
+enum FourDigitPair {
+    static func digest(_ label:String,_ secret:Data,_ client:Data,_ server:Data) -> Data {
+        Data(SHA256.hash(data:Data(label.utf8)+secret+client+server))
+    }
+    static func derive(_ secret:Data,_ client:Data,_ server:Data) -> (String,Data) {
+        let hash=digest("CopyBridge SAS v2",secret,client,server)
+        let value=hash.prefix(4).reduce(UInt32(0)) { ($0 << 8) | UInt32($1) }
+        return (String(format:"%04u",value % 10000),digest("CopyBridge key v2",secret,client,server))
+    }
+    static func request(_ origin:String,_ path:String,body:Data? = nil) throws -> Data {
+        let output=support.appendingPathComponent("four-pair-\(UUID().uuidString).tmp")
+        guard FileManager.default.createFile(atPath:output.path,contents:nil,attributes:[.posixPermissions:0o600]) else { throw BridgeError("LOCAL_IO_FAILED") }
+        defer { try? FileManager.default.removeItem(at:output) }
+        let p=Process(), result=Pipe();p.executableURL=URL(fileURLWithPath:"/usr/bin/curl")
+        var args=["-q","--insecure","--silent","--show-error","--noproxy","*","--proto","=https","--max-redirs","0","--connect-timeout","4","--max-time","8","--max-filesize","32768","--output",output.path,"--write-out","%{http_code}"]
+        if let body,let text=String(data:body,encoding:.utf8) { args += ["--header","Content-Type: application/json","--data-binary",text] }
+        args.append(origin+path);p.arguments=args;p.standardOutput=result;p.standardError=FileHandle.nullDevice
+        try p.run();let value=result.fileHandleForReading.readDataToEndOfFile();p.waitUntilExit()
+        guard p.terminationStatus==0,let status=Int(String(decoding:value,as:UTF8.self)) else { throw BridgeError("QUICK_NETWORK_FAILED") }
+        guard status==200 else { throw BridgeError(status==409 ? "QUICK_UNAVAILABLE" : "QUICK_NETWORK_FAILED") }
+        return try QuickPair.invitationSizedData(output)
+    }
+    static func open(_ sealed:String,key:Data,origin:String) throws -> Invitation {
+        guard let bytes=Data(base64Encoded:sealed),bytes.count>=28,bytes.count<=16412 else { throw BridgeError("QUICK_PACKET_INVALID") }
+        let plain=try AES.GCM.open(AES.GCM.SealedBox(combined:bytes),using:SymmetricKey(data:key),authenticating:Data("CopyBridge pairing v2".utf8))
+        guard let text=String(data:plain,encoding:.utf8) else { throw BridgeError("QUICK_PACKET_INVALID") }
+        let invite=try Invitation.decode(text);guard invite.url==origin else { throw BridgeError("QUICK_ADDRESS_MISMATCH") };return invite
+    }
+}
 enum QuickPair {
     static let context = "CopyBridge quick pairing v1"
     static let alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
@@ -422,6 +453,7 @@ func snapshot(_ source: Source, id: String) throws -> Snapshot {
     let importButton = NSButton(title:"选择配对文件…",target:nil,action:nil)
     let pasteButton = NSButton(title:"粘贴配对码",target:nil,action:nil)
     let connectButton = NSButton(title:"连接这台 Windows",target:nil,action:nil)
+    let fourButton = NSButton(title:"开始四位数字配对",target:nil,action:nil)
     let saveButton = NSButton(title:"保存到两台设备",target:nil,action:nil)
     let settingsFeedback = NSTextField(wrappingLabelWithString:"连接设备后，即可设置同步范围。")
     let revisionLabel = NSTextField(labelWithString:"")
@@ -497,10 +529,46 @@ func snapshot(_ source: Source, id: String) throws -> Snapshot {
         let legacyPaste = NSButton(title:"粘贴旧配对码",target:self,action:#selector(pasteInvitation)); legacyPaste.bezelStyle = .rounded
         importButton.bezelStyle = .rounded; importButton.target = self; importButton.action = #selector(importInvitation)
         legacyConnectButton.bezelStyle = .rounded; legacyConnectButton.target = self; legacyConnectButton.action = #selector(connectInvitation); legacyConnectButton.isEnabled = false
-        legacySection = page([invitationField,stack([legacyPaste,importButton],horizontal:true),previewInfo,legacyConnectButton]); legacySection.isHidden = true
-        let legacyToggle = NSButton(title:"旧版配对码或文件…",target:self,action:#selector(toggleLegacy)); legacyToggle.bezelStyle = .rounded
+        legacySection = page([label("旧版 20 位口令",weight:.medium),quickCodeField,stack([pasteButton,connectButton],horizontal:true),invitationField,stack([legacyPaste,importButton],horizontal:true),previewInfo,legacyConnectButton]); legacySection.isHidden = true
+        let legacyToggle = NSButton(title:"旧版连接方式…",target:self,action:#selector(toggleLegacy)); legacyToggle.bezelStyle = .rounded
+        fourButton.target=self;fourButton.action = #selector(startFourDigit);fourButton.bezelStyle = .rounded;fourButton.bezelColor = .systemBlue
+        fourButton.setAccessibilityIdentifier("four_digit_pair")
         connectionInfo.font = .systemFont(ofSize:12); connectionInfo.textColor = .secondaryLabelColor
-        return page([label("连接你的 Windows",size:20,weight:.semibold),label("在 Windows 点击「复制连接信息」。\n到这台 Mac 复制那行文字，点击下面粘贴，再点连接。",color:.secondaryLabelColor),stack([pasteButton],horizontal:true),label("Windows 地址",weight:.medium),addressField,label("连接口令",weight:.medium),quickCodeField,stack([connectButton],horizontal:true),pairingFeedback,stack([legacyToggle],horizontal:true),legacySection])
+        return page([label("连接你的 Windows",size:20,weight:.semibold),label("在 Windows 打开 CopyBridge，准备配对并查看地址。\n如果已经连接，无需再配对；更换设备请先在 Windows 准备新连接。",color:.secondaryLabelColor),label("Windows 地址",weight:.medium),addressField,stack([fourButton],horizontal:true),pairingFeedback,stack([legacyToggle],horizontal:true),legacySection])
+    }
+    @objc func startFourDigit() {
+        let origin:String
+        do { origin=try QuickPair.origin(addressField.stringValue) }
+        catch { pairingFeedback.stringValue="请填写 Windows 上显示的连接地址。";return }
+        pairingBusy(true);pairingFeedback.stringValue="正在联系 Windows…"
+        quickTask=Task {
+            do {
+                let key=P256.KeyAgreement.PrivateKey(),client=key.publicKey.derRepresentation
+                let body=try JSONSerialization.data(withJSONObject:["publicKey":client.base64EncodedString()])
+                let bytes=try await Task.detached { try FourDigitPair.request(origin,"/v2/pair/start",body:body) }.value
+                let reply=try JSONDecoder().decode(FourDigitStart.self,from:bytes)
+                guard reply.id.range(of:"^[a-f0-9]{32}$",options:.regularExpression) != nil,let server=Data(base64Encoded:reply.publicKey),server.count<=512 else { throw BridgeError("QUICK_PACKET_INVALID") }
+                let peer=try P256.KeyAgreement.PublicKey(derRepresentation:server)
+                let shared=try key.sharedSecretFromKeyAgreement(with:peer)
+                let secret=shared.withUnsafeBytes { Data($0) }
+                let (code,derived)=FourDigitPair.derive(secret,client,server)
+                pairingFeedback.stringValue="配对数字：\(code)\n请核对 Windows 弹窗里的数字，完全相同再点「确认连接」。"
+                let deadline=Date().addingTimeInterval(120)
+                while Date()<deadline {
+                    try Task.checkCancellation();try await Task.sleep(nanoseconds:2_000_000_000)
+                    let data=try await Task.detached { try FourDigitPair.request(origin,"/v2/pair/status?id="+reply.id) }.value
+                    let state=try JSONDecoder().decode(FourDigitStatus.self,from:data)
+                    if state.state=="waiting" { continue }
+                    guard state.state=="approved" else { throw BridgeError("QUICK_PACKET_INVALID") }
+                    let invite=try FourDigitPair.open(state.sealedValue,key:derived,origin:origin)
+                    await app.pair(invite);quickTask=nil;return
+                }
+                throw BridgeError("QUICK_UNAVAILABLE")
+            } catch {
+                pairingBusy(false);pairingFeedback.stringValue = errorCode(error)=="QUICK_UNAVAILABLE" ? "Windows 尚未准备配对，或配对已取消、过期。请在 Windows 重新准备后再试。" : "未能连接，请确认 Windows 已打开新版 CopyBridge 并处于配对页面。"
+            }
+            quickTask=nil
+        }
     }
     @objc func toggleLegacy() { legacySection.isHidden.toggle() }
     @objc func pasteQuickConnection() {
@@ -616,7 +684,7 @@ func snapshot(_ source: Source, id: String) throws -> Snapshot {
         guard let invite = pendingInvite else { return }
         Task { await app.pair(invite) }
     }
-    func pairingBusy(_ busy: Bool) { addressField.isEnabled = !busy; quickCodeField.isEnabled = !busy; connectButton.isEnabled = !busy; invitationField.isEnabled = !busy; importButton.isEnabled = !busy; pasteButton.isEnabled = !busy; legacyConnectButton.isEnabled = !busy && pendingInvite != nil }
+    func pairingBusy(_ busy: Bool) { addressField.isEnabled = !busy; fourButton.isEnabled = !busy; quickCodeField.isEnabled = !busy; connectButton.isEnabled = !busy; invitationField.isEnabled = !busy; importButton.isEnabled = !busy; pasteButton.isEnabled = !busy; legacyConnectButton.isEnabled = !busy && pendingInvite != nil }
     func pairingFinished(_ error: Error?) {
         pairingBusy(false)
         if let error { pairingFeedback.stringValue = friendlyError(error) + "；原来的本机连接配置已保留。" }
@@ -624,10 +692,11 @@ func snapshot(_ source: Source, id: String) throws -> Snapshot {
     }
     func updateStatus() {
         let fresh = app.epoch != nil && !app.paused && connectionIsFresh(last:app.lastSettingsPoll,now:ProcessInfo.processInfo.systemUptime)
+        let syncFailed=app.syncFailure
         liveStatus.stringValue = (app.epoch != nil && !app.paused && !fresh ? "连接状态待确认" : app.stateText) + "  ·  局域网直连"
-        liveStatus.textColor = fresh ? .systemGreen : .systemRed
+        liveStatus.textColor = fresh && !syncFailed ? .systemGreen : .systemRed
         homeDevice.stringValue = "这台 Mac  ↔  " + (app.config?.deviceName ?? "等待连接 Windows")
-        homeHint.stringValue = app.config == nil ? "尚未配对。请点击「查看连接设备」。" : app.paused ? "同步已暂停。点「恢复同步」后，重新复制需要的内容。" : app.epoch == nil ? "未连接：\(app.stateText)" : !fresh ? "连接状态待确认，正在检查 Windows。" : "已建立连接。请复制一段文字，看到「Windows 可粘贴」后再粘贴。"
+        homeHint.stringValue = app.config == nil ? "尚未配对。请点击「查看连接设备」。" : app.paused ? "同步已暂停。点「恢复同步」后，重新复制需要的内容。" : app.epoch == nil ? "未连接：\(app.stateText)" : !fresh ? "连接状态待确认，正在检查 Windows。" : syncFailed ? "连接仍在，但这次没有同步成功：\(app.stateText)" : "已建立连接。请复制一段文字，看到「Windows 可粘贴」后再粘贴。"
         homePause.title = app.paused ? "恢复同步" : "暂停同步"
         homePause.isEnabled = app.settings != nil && !app.savingSettings
         if let c = app.config { connectionInfo.stringValue = "\(app.settings == nil ? "上次设备" : "当前设备")：\(c.deviceName ?? "Windows")  ·  \(c.url)" }
@@ -687,7 +756,7 @@ func friendlyError(_ error: Error) -> String {
     var incomingID: String?; var instanceLock: Int32 = -1
     var lastOutgoing: String?; var reverseSeen: [String:Int] = [:]; var reverseDiscard = Set<String>(); var reversePublished = Set<String>()
     var outgoingTask: Task<Void,Never>?; var incomingTask: Task<Void,Never>?; var loopTask: Task<Void,Never>?
-    var transferID: String?; var timer: Timer?; var stateText = "未连接"
+    var transferID: String?; var timer: Timer?; var stateText = "未连接"; var syncFailure=false
     func log(_ event: String, id: String? = nil, kind: String? = nil, size: Int64? = nil, elapsed: Double? = nil) {
         var entry: [String:Any] = ["timestamp":ISO8601DateFormatter().string(from: Date()), "event":event]
         if let id { entry["transferId"] = id }; if let kind { entry["kind"] = kind }; if let size { entry["bytes"] = size }; if let elapsed { entry["elapsedMs"] = elapsed }
@@ -696,6 +765,7 @@ func friendlyError(_ error: Error) -> String {
         if let f = try? FileHandle(forWritingTo: diagnosticURL) { _ = try? f.seekToEnd(); try? f.write(contentsOf: data + Data([10])); try? f.close() }
     }
     func status(_ text: String) {
+        syncFailure = isSyncFailure(text)
         var display = text
         if text.contains("SESSION_LOCKED") { display = "Windows 已锁定，请解锁后重新复制" }
         else if text.contains("LOCAL_CLIPBOARD_CHANGED") || text.contains("SUPERSEDED") { display = "复制内容已更新，请以最新一次为准" }
@@ -1044,6 +1114,7 @@ func friendlyError(_ error: Error) -> String {
             if state.paused == true { try await fetchSettings(); return }
             let previousSerial = previousPollSerial; let previousCount = previousPollCount
             previousPollSerial = serial; previousPollCount = count
+            if windowsPasteInvalidated(previous:receiverGeneration,current:state.receiverGeneration,status:stateText) { status("Windows 剪贴板已变化，请重新复制") }
             receiverGeneration = state.receiverGeneration
             guard let out = state.outgoing else { lastOutgoing = nil; if let old = incomingID { reverseDiscard.insert(old) }; incomingTask?.cancel(); incomingTask = nil; incomingID = nil; return }
             guard UUID(uuidString:out.transferId) != nil, out.generation == state.receiverGeneration else { throw BridgeError("INVALID_METADATA") }
@@ -1121,6 +1192,12 @@ func remoteObservationSafe(previousSerial: Int, currentSerial: Int, previousCoun
 func connectionIsFresh(last:TimeInterval,now:TimeInterval) -> Bool {
     last > 0 && now >= last && now - last < 8
 }
+func windowsPasteInvalidated(previous:Int64,current:Int64,status:String) -> Bool {
+    previous != current && status == "Windows 可粘贴"
+}
+func isSyncFailure(_ status:String) -> Bool {
+    status.hasPrefix("本次未同步") || status.hasPrefix("本次未接收")
+}
 func errorCode(_ error: Error) -> String {
     if let value = error as? BridgeError { return value.code }
     if error is CancellationError || (error as NSError).code == NSURLErrorCancelled { return "CANCELLED" }
@@ -1129,7 +1206,11 @@ func errorCode(_ error: Error) -> String {
 }
 func option(_ name: String) -> String? { guard let n = CommandLine.arguments.firstIndex(of:name), n + 1 < CommandLine.arguments.count else { return nil }; return CommandLine.arguments[n+1] }
 func selfTest() throws {
+    let (fourCode,fourKey)=FourDigitPair.derive(Data(0..<32),Data("client".utf8),Data("server".utf8))
+    guard fourCode=="2241",hex(fourKey)=="96a8bf23bb72e80bf6eb4ae75e069b66106902e2c661dd62ed0113c78bf17a5f" else { throw BridgeError("SELFTEST_FOUR_DIGIT_VECTOR") }
     guard connectionIsFresh(last:10,now:17), !connectionIsFresh(last:10,now:18), !connectionIsFresh(last:0,now:1) else { throw BridgeError("SELFTEST_CONNECTION_FRESHNESS") }
+    guard windowsPasteInvalidated(previous:1,current:2,status:"Windows 可粘贴"), !windowsPasteInvalidated(previous:1,current:1,status:"Windows 可粘贴"), !windowsPasteInvalidated(previous:1,current:2,status:"正在接收") else { throw BridgeError("SELFTEST_PASTE_STATUS") }
+    guard isSyncFailure("本次未同步：TYPE_DISABLED"),isSyncFailure("本次未接收：DISK_FULL"),!isSyncFailure("Windows 可粘贴") else { throw BridgeError("SELFTEST_FAILURE_COLOR") }
     for origin in ["https://192.168.1.100:43861","https://10.1.2.3:443","https://172.16.0.2:1","https://127.0.0.1:8443"] {
         guard privateOrigin(origin) else { throw BridgeError("SELFTEST_INVITATION_ORIGIN") }
     }
@@ -1199,6 +1280,40 @@ if let path = option("--spool-test") {
         print(String(decoding:json,as:UTF8.self))
     } catch { fputs("Spool test failed: \(errorCode(error))\n",stderr); exit(1) }
     exit(0)
+}
+if let address=option("--four-pair-live-test") {
+    do {
+        try FileManager.default.createDirectory(at:support,withIntermediateDirectories:true,attributes:[.posixPermissions:0o700])
+        let origin=try QuickPair.origin(address),clientKey=P256.KeyAgreement.PrivateKey(),client=clientKey.publicKey.derRepresentation
+        let body=try JSONSerialization.data(withJSONObject:["publicKey":client.base64EncodedString()])
+        let start=try JSONDecoder().decode(FourDigitStart.self,from:FourDigitPair.request(origin,"/v2/pair/start",body:body))
+        guard let server=Data(base64Encoded:start.publicKey),start.id.range(of:"^[a-f0-9]{32}$",options:.regularExpression) != nil else { throw BridgeError("SELFTEST_FOUR_RESPONSE") }
+        let peer=try P256.KeyAgreement.PublicKey(derRepresentation:server),secret=try clientKey.sharedSecretFromKeyAgreement(with:peer).withUnsafeBytes { Data($0) }
+        let (code,key)=FourDigitPair.derive(secret,client,server);print("MATCH_CODE=\(code)");fflush(stdout)
+        let deadline=Date().addingTimeInterval(115)
+        while Date()<deadline {
+            sleep(2)
+            let status=try JSONDecoder().decode(FourDigitStatus.self,from:FourDigitPair.request(origin,"/v2/pair/status?id="+start.id))
+            if status.state=="waiting" { continue }
+            guard status.state=="approved" else { throw BridgeError("SELFTEST_FOUR_STATUS") }
+            _ = try FourDigitPair.open(status.sealedValue,key:key,origin:origin)
+            print("PASS: approved four-digit Windows invitation authenticated on Mac");exit(0)
+        }
+        throw BridgeError("SELFTEST_FOUR_TIMEOUT")
+    } catch { fputs("Four-digit live test failed: \(error)\n",stderr);exit(1) }
+}
+if let fixturePath = option("--four-pair-test-fixture") {
+    do {
+        struct FourFixture:Decodable { let clientPrivate:String;let serverPublic:String;let code:String;let sealedValue:String }
+        let fixture=try JSONDecoder().decode(FourFixture.self,from:Data(contentsOf:URL(fileURLWithPath:fixturePath)))
+        guard let clientBytes=Data(base64Encoded:fixture.clientPrivate),let serverBytes=Data(base64Encoded:fixture.serverPublic),let sealed=Data(base64Encoded:fixture.sealedValue) else { throw BridgeError("SELFTEST_FOUR_FIXTURE") }
+        let client=try P256.KeyAgreement.PrivateKey(derRepresentation:clientBytes),server=try P256.KeyAgreement.PublicKey(derRepresentation:serverBytes)
+        let secret=try client.sharedSecretFromKeyAgreement(with:server).withUnsafeBytes { Data($0) }
+        let (code,key)=FourDigitPair.derive(secret,client.publicKey.derRepresentation,serverBytes)
+        let plain=try AES.GCM.open(AES.GCM.SealedBox(combined:sealed),using:SymmetricKey(data:key),authenticating:Data("CopyBridge pairing v2".utf8))
+        guard code==fixture.code,String(data:plain,encoding:.utf8)=="test invitation" else { throw BridgeError("SELFTEST_FOUR_CROSS_PLATFORM") }
+        print("PASS: Windows and Mac four-digit agreement");exit(0)
+    } catch { fputs("Four-digit test failed: \(error)\n",stderr);exit(1) }
 }
 if let fixturePath = option("--quick-pair-test-fixture") {
     MainActor.assumeIsolated {

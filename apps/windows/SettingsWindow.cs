@@ -82,19 +82,32 @@ sealed class SettingsWindow:System.Windows.Window {
         }
         var window=new System.Windows.Window{Title="最近同步记录",Width=700,Height=560,Owner=this,Content=Scroll(list)};window.Show();
     }
+    internal void ShowFourDigitPrompt(string code,DateTimeOffset expires,System.Action<bool> completed) {
+        bool approved=false;var prompt=new System.Windows.Window{Title="CopyBridge 安全配对",Width=460,Height=260,Owner=this,Topmost=true,WindowStartupLocation=WindowStartupLocation.CenterOwner,ResizeMode=ResizeMode.NoResize};
+        var title=Label("请核对 Mac 上的四位数字",18,FontWeights.SemiBold);
+        var digits=Label(code,36,FontWeights.Bold);digits.TextAlignment=TextAlignment.Center;
+        var accept=Action("数字相同，确认连接",()=>{approved=true;prompt.Close();},true);
+        var cancel=Action("不相同 / 取消",()=>prompt.Close());
+        prompt.Content=Stack(title,digits,Label("只有两边数字完全一样时才确认。",14,null,Muted),Row(accept,cancel));
+        var expiry=new DispatcherTimer{Interval=TimeSpan.FromSeconds(1)};
+        expiry.Tick+=(_,_)=>{if(DateTimeOffset.UtcNow>=expires)prompt.Close();};
+        prompt.Closed+=(_,_)=>{expiry.Stop();completed(approved&&DateTimeOffset.UtcNow<expires);};
+        expiry.Start();prompt.Show();prompt.Activate();
+    }
     C.ScrollViewer ConnectionPage(){
         var panel=Stack(Label("把两台电脑连起来",28,FontWeights.SemiBold),Label("只在第一次连接时操作，以后打开就能继续用",14,null,Muted));
         pairedInfo.Children.Add(Label("你的 Mac 已经配对",19,FontWeights.SemiBold));TextStyle(peer,14,Muted);pairedInfo.Children.Add(peer);pairedInfo.Children.Add(Row(Action("回到我的设备",()=>ShowPage(0),true)));
         var replace=Stack(Label("重新配对会让旧连接失效，需要在 Mac 再确认一次",13,null,Muted),Row(Action("准备连接新设备",GenerateInvitation),Action("断开当前 Mac",Disconnect)));
         pairedInfo.Children.Add(new C.Expander{Header="更换或断开设备",Content=replace,Margin=new Thickness(0,12,0,0)});pairedCard=Box(pairedInfo);panel.Children.Add(pairedCard);
-        pairingSteps.Children.Add(Label("只需要地址和短口令",20,FontWeights.SemiBold));
-        pairingSteps.Children.Add(Label("在 Mac 的「连接设备」填写下面两项，或直接粘贴整行连接信息",14,null,Muted));
+        pairingSteps.Children.Add(Label("四位数字配对",20,FontWeights.SemiBold));
+        pairingSteps.Children.Add(Label("在 Mac 的「连接设备」填写下面的地址并开始配对。Windows 会弹出四位数字；两边数字相同后点「确认连接」。",14,null,Muted));
         foreach(var input in new[]{quickAddress,quickCode}){input.IsReadOnly=true;input.FontSize=18;input.Padding=new Thickness(12);input.Margin=new Thickness(0,0,0,14);input.BorderBrush=Line;input.BorderThickness=new Thickness(1);}
         quickAddress.Text=Program.QuickAddress;AutomationProperties.SetName(quickAddress,"Windows 地址");AutomationProperties.SetName(quickCode,"短连接口令");
-        pairingSteps.Children.Add(Label("Windows 地址",14,FontWeights.SemiBold));pairingSteps.Children.Add(quickAddress);pairingSteps.Children.Add(Label("连接口令",14,FontWeights.SemiBold));pairingSteps.Children.Add(quickCode);
+        pairingSteps.Children.Add(Label("Windows 地址",14,FontWeights.SemiBold));pairingSteps.Children.Add(quickAddress);
+        pairingSteps.Children.Add(Row(Action("准备四位配对",GenerateInvitation)));
         copy.Content="复制连接信息";copy.Style=(Style)FindResource("Primary");copy.Click+=(_,_)=>Safely(()=>{Program.CopyQuickConnection();Refresh();inviteFeedback.Text="已复制一行连接信息。到 Mac 点击「粘贴连接信息」，再点「连接」。";});
-        pairingSteps.Children.Add(Row(copy));TextStyle(invitation,13,Muted);pairingSteps.Children.Add(invitation);TextStyle(inviteFeedback,13,Blue);pairingSteps.Children.Add(inviteFeedback);
-        export.Content="保存旧版配对文件";export.Click+=(_,_)=>SaveInvite();var oldCode=Action("复制旧版长码",()=>Safely(Program.CopyInvitation));pairingSteps.Children.Add(new C.Expander{Header="兼容旧版客户端",Content=Row(export,oldCode,Action("刷新连接信息",GenerateInvitation)),Margin=new Thickness(0,20,0,0)});panel.Children.Add(pairingSteps);
+        TextStyle(invitation,13,Muted);pairingSteps.Children.Add(invitation);TextStyle(inviteFeedback,13,Blue);pairingSteps.Children.Add(inviteFeedback);
+        export.Content="保存旧版配对文件";export.Click+=(_,_)=>SaveInvite();var oldCode=Action("复制旧版长码",()=>Safely(Program.CopyInvitation));pairingSteps.Children.Add(new C.Expander{Header="兼容旧版客户端",Content=Stack(Label("旧版连接口令",14,FontWeights.SemiBold),quickCode,Row(copy),Row(export,oldCode,Action("刷新连接信息",GenerateInvitation))),Margin=new Thickness(0,20,0,0)});panel.Children.Add(pairingSteps);
         var detail=Stack(Label("Windows 连接地址",13,FontWeights.SemiBold),new C.TextBox{Text=Program.Origin,IsReadOnly=true,Padding=new Thickness(12),BorderBrush=Line,BorderThickness=new Thickness(1)},Label("地址由程序自动选择，不需要手动填写",12,null,Muted));panel.Children.Add(new C.Expander{Header="连接不上？查看网络检查",Margin=new Thickness(0,24,0,0),Content=Stack(Step("1","先检查网络","避免使用访客 Wi-Fi；确认两台电脑都已打开 CopyBridge"),Step("2","检查 Windows 的网络提示","仅在你信任的专用网络允许 CopyBridge 通信，不要关闭整机防火墙"),detail)});
         if(Program.Origin.Contains("127.0.0.1"))panel.Children.Add(Label("当前没有可用的局域网地址，请连接网络后退出并重新打开",13,null,Hex("#AD6516")));return Scroll(panel);
     }
@@ -122,17 +135,18 @@ sealed class SettingsWindow:System.Windows.Window {
     static string FriendlyStatus(string status)=>status switch{"TYPE_DISABLED"=>"本次内容类型未开启同步","DIRECTION_DISABLED"=>"这个方向已关闭同步","SENSITIVE_SOURCE"=>"已跳过私密内容","CLIPBOARD_BUSY"=>"剪贴板正忙，请稍后重新复制","SOURCE_UNAVAILABLE"=>"文件暂时无法读取，请重新复制","SOURCE_CHANGED"=>"文件有变化，请完成编辑后重新复制","SIZE_LIMIT"=>"内容超过大小限制","SESSION_REVOKED"=>"正在重新连接，请重新复制","SUPERSEDED"=>"已保留最新复制的内容",_=>status};
     void Refresh(){
         bool paired=Program.Identity.Token!=null,online=Program.PeerRecentlySeen&&bridge.Epoch!=""&&NativeClipboard.GetClipboardSequenceNumber()!=0&&NativeClipboard.SessionLocked()!=true;
+        bool failed=bridge.Status.Contains("失败")||new[]{"TYPE_DISABLED","DIRECTION_DISABLED","CLIPBOARD_BUSY","SOURCE_UNAVAILABLE","SOURCE_CHANGED","SIZE_LIMIT","INTERNAL_ERROR","PUBLISH_FAILED"}.Contains(bridge.Status);
         homeTitle.Text=paired?"这边复制，那边继续":"让两台电脑，共用复制粘贴";
         homeSubtitle.Text=paired?"文字、截图和文件，沿用你熟悉的快捷键":"先连接你的 Mac，之后就像在同一台电脑上操作";
-        string state=!paired?"尚未配对":bridge.Paused?"同步已暂停":!online?"未连接：等待 Mac":"已连接，请复制文字测试";
-        railState.Text=state;homeState.Text=state;stateDot.Fill=paired&&online&&!bridge.Paused?Hex("#127C5D"):Hex("#8090A8");
+        string state=!paired?"尚未配对":bridge.Paused?"同步已暂停":!online?"未连接：等待 Mac":failed?"已连接，本次同步未成功":"已连接，请复制文字测试";
+        railState.Text=state;homeState.Text=state;stateDot.Fill=paired&&online&&!bridge.Paused&&!failed?Hex("#127C5D"):Hex("#8090A8");
         homeHint.Text=!paired?"第一次只需完成一次配对，点击下方开始":bridge.Paused?"点击恢复后，请重新复制需要的内容":!online?"请在 Mac 打开 CopyBridge，并确认两台电脑在同一网络":FriendlyStatus(bridge.Status);
         homeConnect.Content=paired?"查看连接":"连接我的 Mac";homePause.Content=bridge.Paused?"恢复同步":"暂停同步";homePause.Visibility=paired?Visibility.Visible:Visibility.Collapsed;
         pairedCard.Visibility=paired?Visibility.Visible:Visibility.Collapsed;pairingSteps.Visibility=paired?Visibility.Collapsed:Visibility.Visible;
         peer.Text=online?"两台设备保持连接，今后不用重复配对":"配对关系已保存，请在 Mac 打开 CopyBridge";
         bool available=Program.InvitationAvailable;copy.IsEnabled=!paired;export.IsEnabled=available;
         quickCode.Text=Program.QuickCode;
-        invitation.Text=available?"10 分钟内有效；连接成功后自动保存，以后不用再填":"点击「复制连接信息」即可准备新的短口令";
+        invitation.Text=available?"准备就绪：请在 Mac 开始配对，并核对两边四位数字":"配对已过期，请点击「准备四位配对」";
         var settings=bridge.Settings.Current;
         if(!dirty&&loadedRevision!=settings.Revision){loading=true;toWindows.IsChecked=settings.MacToWindows;toMac.IsChecked=settings.WindowsToMac;text.IsChecked=settings.Text;image.IsChecked=settings.Image;file.IsChecked=settings.File;paused.IsChecked=settings.Paused;loadedRevision=settings.Revision;loading=false;}
         else if(dirty&&loadedRevision!=settings.Revision)feedback.Text="另一台更新了设置，请重新载入后再保存";
