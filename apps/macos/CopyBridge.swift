@@ -541,8 +541,9 @@ func snapshot(_ source: Source, id: String) throws -> Snapshot {
         homeHint.setAccessibilityIdentifier("home_next_step")
         let connect = NSButton(title:"查看连接设备",target:self,action:#selector(openConnection))
         let files = NSButton(title:"打开收到的文件",target:app,action:#selector(App.openReceived))
+        let history = NSButton(title:"最近同步记录",target:app,action:#selector(App.showHistory))
         homePause.target = app; homePause.action = #selector(App.togglePause)
-        for button in [connect,files,homePause] { button.bezelStyle = .rounded }
+        for button in [connect,files,history,homePause] { button.bezelStyle = .rounded }
         return page([
             label("复制一下，换台电脑继续",size:23,weight:.semibold),
             card([homeDevice,homeHint,stack([connect,homePause],horizontal:true)]),
@@ -550,7 +551,7 @@ func snapshot(_ source: Source, id: String) throws -> Snapshot {
             label("1   在这台 Mac 复制\n      选中文字、截图或一个文件，按 ⌘ C",size:15),
             label("2   等待上方显示「Windows 可粘贴」\n      大文件需要多等一会儿",size:15),
             label("3   去 Windows 按 Ctrl + V\n      反过来也一样：Windows 复制，Mac 按 ⌘ V",size:15),
-            stack([files],horizontal:true),
+            stack([history,files],horizontal:true),
             label("关闭窗口后仍会同步。下次双击桌面的 CopyBridge 就能回来。\n刚连接或恢复同步时，请重新复制一次。",size:12,color:.secondaryLabelColor)
         ])
     }
@@ -622,9 +623,11 @@ func snapshot(_ source: Source, id: String) throws -> Snapshot {
         else { quickCodeField.stringValue = ""; invitationField.stringValue = ""; pendingInvite = nil; legacyConnectButton.isEnabled = false; pairingFeedback.stringValue = "配对成功。现在可以复制新内容。"; tabs.selectedSegment = 0; selectTab(); updateStatus(); updateSettings(force:true) }
     }
     func updateStatus() {
-        liveStatus.stringValue = app.stateText + "  ·  局域网直连"
+        let fresh = app.epoch != nil && !app.paused && connectionIsFresh(last:app.lastSettingsPoll,now:ProcessInfo.processInfo.systemUptime)
+        liveStatus.stringValue = (app.epoch != nil && !app.paused && !fresh ? "连接状态待确认" : app.stateText) + "  ·  局域网直连"
+        liveStatus.textColor = fresh ? .systemGreen : .systemRed
         homeDevice.stringValue = "这台 Mac  ↔  " + (app.config?.deviceName ?? "等待连接 Windows")
-        homeHint.stringValue = app.config == nil ? "先点「查看连接设备」，按提示连接你的 Windows。" : app.paused ? "同步已暂停。点「恢复同步」后，重新复制需要的内容。" : app.epoch == nil ? "正在等待 Windows。请确认两端都已打开，并连接同一网络。" : "两台设备已连接。现在可以复制新内容，按下面三步试一试。"
+        homeHint.stringValue = app.config == nil ? "尚未配对。请点击「查看连接设备」。" : app.paused ? "同步已暂停。点「恢复同步」后，重新复制需要的内容。" : app.epoch == nil ? "未连接：\(app.stateText)" : !fresh ? "连接状态待确认，正在检查 Windows。" : "已建立连接。请复制一段文字，看到「Windows 可粘贴」后再粘贴。"
         homePause.title = app.paused ? "恢复同步" : "暂停同步"
         homePause.isEnabled = app.settings != nil && !app.savingSettings
         if let c = app.config { connectionInfo.stringValue = "\(app.settings == nil ? "上次设备" : "当前设备")：\(c.deviceName ?? "Windows")  ·  \(c.url)" }
@@ -676,7 +679,7 @@ func friendlyError(_ error: Error) -> String {
 
 @MainActor final class App: NSObject, NSApplicationDelegate {
     var statusItem: NSStatusItem!; var statusRow: NSMenuItem!; var pauseRow: NSMenuItem!
-    var settingsWindow: SettingsWindow?; var settings: SyncSettings?; var credentialsAttempted = false; var pairing = false; var savingSettings = false; var lastSettingsPoll = 0.0
+    var settingsWindow: SettingsWindow?; var historyWindow:NSWindow?; var settings: SyncSettings?; var credentialsAttempted = false; var pairing = false; var savingSettings = false; var lastSettingsPoll = 0.0; var lastStatusRefresh = 0.0
     var net: Network!; var config: Config!; var diagnosticURL = support.appendingPathComponent("diagnostics.jsonl")
     let sessionID = UUID().uuidString
     var epoch: String?; var receiverGeneration: Int64 = 0; var sequence: Int64 = 0
@@ -711,7 +714,11 @@ func friendlyError(_ error: Error) -> String {
             instanceLock = open(support.appendingPathComponent("instance.lock").path,O_CREAT | O_RDWR,0o600)
             guard instanceLock >= 0, flock(instanceLock,LOCK_EX | LOCK_NB) == 0 else { NSApplication.shared.terminate(nil); return }
             lastCount = NSPasteboard.general.changeCount
-            timer = Timer.scheduledTimer(withTimeInterval:0.1,repeats:true) { [weak self] _ in Task { @MainActor in self?.observe() } }
+            timer = Timer.scheduledTimer(withTimeInterval:0.1,repeats:true) { [weak self] _ in Task { @MainActor in
+                guard let self else { return }; self.observe()
+                let now=ProcessInfo.processInfo.systemUptime
+                if now-self.lastStatusRefresh >= 1 { self.settingsWindow?.updateStatus(); self.lastStatusRefresh=now }
+            } }
             loopTask = Task { await self.loop() }
             if let path = option("--diagnostics") { diagnosticURL = URL(fileURLWithPath:path) }
             if FileManager.default.fileExists(atPath:configURL.path) {
@@ -750,6 +757,42 @@ func friendlyError(_ error: Error) -> String {
     }
     @objc func showSettings() { if settingsWindow == nil { settingsWindow = SettingsWindow(app:self) }; settingsWindow?.show() }
     @objc func openReceived() { NSWorkspace.shared.open(received) }
+    @objc func revealHistory(_ sender:NSButton) {
+        guard let path=sender.identifier?.rawValue else { return }
+        NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath:path)])
+    }
+    @objc func showHistory() {
+        let fm=FileManager.default
+        let keys:[URLResourceKey] = [.isRegularFileKey,.isSymbolicLinkKey,.contentModificationDateKey]
+        let enumerator=fm.enumerator(at:received,includingPropertiesForKeys:keys,options:[.skipsHiddenFiles,.skipsPackageDescendants])
+        var entries:[(URL,Date)] = []
+        while let url=enumerator?.nextObject() as? URL {
+            guard let v=try? url.resourceValues(forKeys:Set(keys)),v.isRegularFile == true,v.isSymbolicLink != true,
+                  ["txt","png","jpg","jpeg","gif"].contains(url.pathExtension.lowercased()) else { continue }
+            entries.append((url,v.contentModificationDate ?? .distantPast))
+        }
+        entries.sort { $0.1 > $1.1 }
+        let win=NSWindow(contentRect:NSRect(x:0,y:0,width:680,height:560),styleMask:[.titled,.closable,.resizable],backing:.buffered,defer:false)
+        win.title="最近同步记录";win.isReleasedWhenClosed=false
+        let scroll=NSScrollView(frame:win.contentView!.bounds);scroll.autoresizingMask=[.width,.height];scroll.hasVerticalScroller=true
+        let list=NSStackView();list.orientation = .vertical;list.alignment = .leading;list.spacing=10;list.edgeInsets=NSEdgeInsets(top:20,left:20,bottom:20,right:20)
+        let note=NSTextField(wrappingLabelWithString:"本机收到的文字和图片，按时间排列。点击后在访达中查看或删除。最多显示最近 100 条。")
+        list.addArrangedSubview(note)
+        let format=DateFormatter();format.dateFormat="yyyy-MM-dd HH:mm"
+        // shortcut: show the most recent 100 files, add pagination when history grows beyond this.
+        for (url,date) in entries.prefix(100) {
+            var description=url.lastPathComponent
+            if url.pathExtension.lowercased()=="txt",let f=try? FileHandle(forReadingFrom:url) {
+                let data=(try? f.read(upToCount:512)) ?? Data();try? f.close()
+                if let preview=String(data:data,encoding:.utf8)?.replacingOccurrences(of:"\n",with:" "),!preview.isEmpty { description=String(preview.prefix(70)) }
+            }
+            let button=NSButton(title:"\(format.string(from:date))  \(description)",target:self,action:#selector(revealHistory(_:)))
+            button.identifier=NSUserInterfaceItemIdentifier(url.path);button.alignment = .left;list.addArrangedSubview(button)
+        }
+        if entries.isEmpty { list.addArrangedSubview(NSTextField(labelWithString:"还没有收到文字或图片。")) }
+        list.frame=NSRect(x:0,y:0,width:640,height:max(520,CGFloat(list.arrangedSubviews.count)*38+40));scroll.documentView=list;win.contentView?.addSubview(scroll)
+        historyWindow=win;win.center();win.makeKeyAndOrderFront(nil);NSApplication.shared.activate(ignoringOtherApps:true)
+    }
     @objc func quit() { settingsWindow?.quickTask?.cancel(); cancelWork(); loopTask?.cancel(); net?.cancelAll(); NSApplication.shared.terminate(nil) }
     @objc func cancelCurrent() { cancelWork(); status("已取消，请重新复制") }
     func cancelWork() {
@@ -1075,6 +1118,9 @@ func friendlyError(_ error: Error) -> String {
 func remoteObservationSafe(previousSerial: Int, currentSerial: Int, previousCount: Int, currentCount: Int) -> Bool {
     previousSerial == currentSerial && previousCount == currentCount
 }
+func connectionIsFresh(last:TimeInterval,now:TimeInterval) -> Bool {
+    last > 0 && now >= last && now - last < 8
+}
 func errorCode(_ error: Error) -> String {
     if let value = error as? BridgeError { return value.code }
     if error is CancellationError || (error as NSError).code == NSURLErrorCancelled { return "CANCELLED" }
@@ -1083,6 +1129,7 @@ func errorCode(_ error: Error) -> String {
 }
 func option(_ name: String) -> String? { guard let n = CommandLine.arguments.firstIndex(of:name), n + 1 < CommandLine.arguments.count else { return nil }; return CommandLine.arguments[n+1] }
 func selfTest() throws {
+    guard connectionIsFresh(last:10,now:17), !connectionIsFresh(last:10,now:18), !connectionIsFresh(last:0,now:1) else { throw BridgeError("SELFTEST_CONNECTION_FRESHNESS") }
     for origin in ["https://192.168.1.100:43861","https://10.1.2.3:443","https://172.16.0.2:1","https://127.0.0.1:8443"] {
         guard privateOrigin(origin) else { throw BridgeError("SELFTEST_INVITATION_ORIGIN") }
     }

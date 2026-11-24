@@ -96,9 +96,11 @@ sealed class Bridge {
         if(NativeClipboard.SessionLocked()==true)throw new Fault("SESSION_LOCKED");
         if(Paused)throw new Fault("PAUSED"); Uuid(session);Uuid(handshake); if(last<0)throw new Fault("INVALID_SEQUENCE",400);
         if(Epoch!=""&&Session==session&&Handshake==handshake)return HelloView();
+        uint clipboardSequence=NativeClipboard.GetClipboardSequenceNumber();
+        if(clipboardSequence==0) { Revoke(); throw new Fault("CLIPBOARD_ACCESS_DENIED"); }
         Revoke(); Transfers.Clear(); if(!sessionHigh.ContainsKey(session)&&sessionHigh.Count>=1024)throw new Fault("SOURCE_SESSION_LIMIT"); Session=session;Handshake=handshake;HighWater=Math.Max(sessionHigh.GetValueOrDefault(session),last);Floor=HighWater;
-        sessionHigh[session]=HighWater; Epoch=Guid.NewGuid().ToString(); Sequence=NativeClipboard.GetClipboardSequenceNumber();
-        if(Sequence==0)throw new Fault("CLIPBOARD_ACCESS_DENIED"); Notify("已连接，双向同步；请重新复制");return HelloView();
+        sessionHigh[session]=HighWater; Epoch=Guid.NewGuid().ToString(); Sequence=clipboardSequence;
+        Notify("已连接，双向同步；请重新复制");return HelloView();
     }
     object HelloView()=>new {connectionEpoch=Epoch,seqFloor=Floor,receiverGeneration=Generation,deviceId=Program.Identity.DeviceId,limits=new{textBytes=1048576,imageBytes=33554432,fileBytes=2147483648L},outgoing=(object?)null};
     internal void CheckEpoch(string epoch) {if(NativeClipboard.SessionLocked()==true)throw new Fault("SESSION_LOCKED");if(Paused||Epoch==""||epoch!=Epoch)throw new Fault("SESSION_REVOKED");}
@@ -126,10 +128,14 @@ sealed class Bridge {
         var t=Valid(offer.TransferId);AllowIncoming(offer.Kind); if(t.Head!=offer.Head)throw new Fault("IDEMPOTENCY_CONFLICT");
         if(t.Offer!=null) {if(JsonSerializer.Serialize(t.Offer,Json)!=JsonSerializer.Serialize(offer,Json))throw new Fault("IDEMPOTENCY_CONFLICT");return Result(t);}
         if(offer.Items?.Length!=1)throw new Fault("TYPE_UNSUPPORTED",400);ValidateItem(offer.Kind,offer.Items[0]);
-        long retained=Directory.EnumerateFiles(Received,"*",SearchOption.AllDirectories).Sum(p=>new FileInfo(p).Length);
+        long retained=RetainedBytes(Received);
         if(retained+offer.Items[0].SizeBytes>20L*1024*1024*1024)throw new Fault("RECEIVED_BUDGET");
         var drive=new DriveInfo(Path.GetPathRoot(Received)!); if(drive.AvailableFreeSpace<offer.Items[0].SizeBytes+128*1024*1024)throw new Fault("DISK_FULL");
         string dir=Path.Combine(Received,Epoch,offer.TransferId);Directory.CreateDirectory(dir);t.Path=Path.Combine(dir,offer.Items[0].Name);t.Offer=offer;t.State="Offered";Notify("正在传输，尚不可粘贴");return Result(t);
+    }
+    internal static long RetainedBytes(string path) {
+        Directory.CreateDirectory(path);
+        return Directory.EnumerateFiles(path,"*",SearchOption.AllDirectories).Sum(p=>new FileInfo(p).Length);
     }
     internal async Task<object> Complete(string id) {
         var transfer=await OnUI(()=>Transfers.TryGetValue(id,out var t)?t:throw new Fault("NOT_FOUND",404));

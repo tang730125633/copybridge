@@ -286,6 +286,9 @@ static class Program {
             finally {Marshal.FinalReleaseComObject(link);Marshal.FinalReleaseComObject(shell);}
         } finally {Directory.Delete(shortcutDirectory,true);}
         void Check(bool ok){if(!ok)throw new Exception("assertion failed");}
+        string historyTest=Path.Combine(Path.GetTempPath(),"CopyBridge-received-test-"+Guid.NewGuid().ToString("N"));
+        try { Check(Bridge.RetainedBytes(historyTest)==0&&Directory.Exists(historyTest));File.WriteAllText(Path.Combine(historyTest,"test.txt"),"abc");Check(Bridge.RetainedBytes(historyTest)==3);File.WriteAllText(Path.Combine(historyTest,"metadata.json"),"{}");Check(SettingsWindow.HistoryFiles(historyTest).Length==1); }
+        finally { if(Directory.Exists(historyTest))Directory.Delete(historyTest,true); }
         foreach(var name in new[]{"../a","C:\\a","NUL.txt","a:ads","a.","a/1","CON","COM¹.txt","LPT²"}) {try{Bridge.ValidateName(name);throw new Exception("accepted bad name");}catch(Fault f){Check(f.Message=="INVALID_FILENAME");}}
         Bridge.ValidateName("图片 测试.png");
         Bridge.ValidateItem("file",new("f1","普通文档.pdf","application/octet-stream",100,new string('a',64)));

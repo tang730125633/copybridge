@@ -2,6 +2,8 @@ using System.Windows;
 using System.Windows.Automation;
 using System.Windows.Media;
 using System.Windows.Threading;
+using System.IO;
+using System.Diagnostics;
 using C=System.Windows.Controls;
 using Button=System.Windows.Controls.Button;
 using CheckBox=System.Windows.Controls.CheckBox;
@@ -60,7 +62,25 @@ sealed class SettingsWindow:System.Windows.Window {
         devices.Children.Add(Device("这台 Windows",Environment.MachineName,"⊞"));var arrow=Label("⇄",30,null,Blue);arrow.HorizontalAlignment=System.Windows.HorizontalAlignment.Center;arrow.VerticalAlignment=System.Windows.VerticalAlignment.Center;arrow.Margin=new Thickness(0,0,0,35);C.Grid.SetColumn(arrow,1);devices.Children.Add(arrow);var mac=Device("你的 Mac","打开 Mac 版 CopyBridge","⌘");C.Grid.SetColumn(mac,2);devices.Children.Add(mac);
         TextStyle(homeState,15);homeState.FontWeight=FontWeights.SemiBold;homeState.Margin=new Thickness(0);var status=new C.StackPanel{Orientation=C.Orientation.Horizontal,Margin=new Thickness(0,0,0,10)};status.Children.Add(stateDot);status.Children.Add(homeState);TextStyle(homeHint,13,Muted);
         homeConnect.Style=(Style)FindResource("Primary");homeConnect.Click+=(_,_)=>ShowPage(1);homePause.Content="暂停同步";homePause.Click+=(_,_)=>Safely(()=>bridge.Pause(!bridge.Paused));
-        var panel=Stack(homeTitle,homeSubtitle,Box(Stack(devices,status,homeHint,Row(homeConnect,homePause))),Label("第一次，用一小段文字试试",18,FontWeights.SemiBold),Step("1","在 Windows 复制","选中一段文字，按 Ctrl + C"),Step("2","到 Mac 粘贴","Mac 显示「Mac 可粘贴」后，按 ⌘ V"),Label("反过来也一样：Mac 按 ⌘ C，Windows 按 Ctrl + V",13,null,Muted),Row(Action("打开收到的文件",()=>Safely(Program.OpenReceived)),Action("查看完整指南",()=>ShowPage(3))),Label("关闭窗口后仍在后台同步，下次双击 CopyBridge 即可回来",12,null,Muted));return Scroll(panel);
+        var panel=Stack(homeTitle,homeSubtitle,Box(Stack(devices,status,homeHint,Row(homeConnect,homePause))),Label("第一次，用一小段文字试试",18,FontWeights.SemiBold),Step("1","在 Windows 复制","选中一段文字，按 Ctrl + C"),Step("2","到 Mac 粘贴","Mac 显示「Mac 可粘贴」后，按 ⌘ V"),Label("反过来也一样：Mac 按 ⌘ C，Windows 按 Ctrl + V",13,null,Muted),Row(Action("最近同步记录",()=>Safely(ShowHistory)),Action("打开收到的文件",()=>Safely(Program.OpenReceived)),Action("查看完整指南",()=>ShowPage(3))),Label("关闭窗口后仍在后台同步，下次双击 CopyBridge 即可回来",12,null,Muted));return Scroll(panel);
+    }
+    internal static string[] HistoryFiles(string root) {
+        if(!Directory.Exists(root))return [];
+        var options=new EnumerationOptions{RecurseSubdirectories=true,IgnoreInaccessible=true,AttributesToSkip=FileAttributes.ReparsePoint|FileAttributes.Hidden|FileAttributes.System};
+        // shortcut: show the most recent 100 files, add pagination when history grows beyond this.
+        return Directory.EnumerateFiles(root,"*",options).Where(p=>new[]{".txt",".png",".jpg",".jpeg",".gif"}.Contains(Path.GetExtension(p).ToLowerInvariant())).OrderByDescending(File.GetLastWriteTimeUtc).Take(100).ToArray();
+    }
+    void ShowHistory() {
+        var files=HistoryFiles(bridge.Received);
+        var list=Stack(Label("本机收到的文字和图片，按时间排列。点击后在文件夹中查看或删除。最多显示最近 100 条。",14,null,Muted));
+        if(files.Length==0)list.Children.Add(Label("还没有收到文字或图片。",14));
+        foreach(var path in files) {
+            string name=Path.GetFileName(path);
+            if(Path.GetExtension(path).Equals(".txt",StringComparison.OrdinalIgnoreCase))try{using var reader=new StreamReader(path);var chars=new char[70];int n=reader.ReadBlock(chars,0,chars.Length);if(n>0)name=new string(chars,0,n).Replace('\n',' ').Replace('\r',' ');}catch(IOException){}catch(UnauthorizedAccessException){}
+            var button=Action($"{File.GetLastWriteTime(path):yyyy-MM-dd HH:mm}  {name}",()=>Process.Start(new ProcessStartInfo("explorer.exe",$"/select,\"{path}\""){UseShellExecute=true}));
+            button.HorizontalAlignment=System.Windows.HorizontalAlignment.Left;list.Children.Add(button);
+        }
+        var window=new System.Windows.Window{Title="最近同步记录",Width=700,Height=560,Owner=this,Content=Scroll(list)};window.Show();
     }
     C.ScrollViewer ConnectionPage(){
         var panel=Stack(Label("把两台电脑连起来",28,FontWeights.SemiBold),Label("只在第一次连接时操作，以后打开就能继续用",14,null,Muted));
@@ -101,10 +121,10 @@ sealed class SettingsWindow:System.Windows.Window {
     static string Explain(Exception e)=>e is Fault f?f.Message switch{"SETTINGS_CONFLICT"=>"另一台电脑更新了设置，请重新载入后再保存","CLIPBOARD_BUSY"=>"剪贴板正忙，请稍后重试","SESSION_LOCKED"=>"请先解锁 Windows","INVITATION_UNAVAILABLE"=>"连接文件已过期或已被使用，请刷新有效期","ADDRESS_CERTIFICATE_MISMATCH"=>"网络地址发生变化，请恢复配对时的网络后重试",_=>"操作未完成，请检查两台电脑的连接后重试"}:"无法完成操作，请检查可用空间和文件权限";
     static string FriendlyStatus(string status)=>status switch{"TYPE_DISABLED"=>"本次内容类型未开启同步","DIRECTION_DISABLED"=>"这个方向已关闭同步","SENSITIVE_SOURCE"=>"已跳过私密内容","CLIPBOARD_BUSY"=>"剪贴板正忙，请稍后重新复制","SOURCE_UNAVAILABLE"=>"文件暂时无法读取，请重新复制","SOURCE_CHANGED"=>"文件有变化，请完成编辑后重新复制","SIZE_LIMIT"=>"内容超过大小限制","SESSION_REVOKED"=>"正在重新连接，请重新复制","SUPERSEDED"=>"已保留最新复制的内容",_=>status};
     void Refresh(){
-        bool paired=Program.Identity.Token!=null,online=Program.PeerRecentlySeen;
+        bool paired=Program.Identity.Token!=null,online=Program.PeerRecentlySeen&&bridge.Epoch!=""&&NativeClipboard.GetClipboardSequenceNumber()!=0&&NativeClipboard.SessionLocked()!=true;
         homeTitle.Text=paired?"这边复制，那边继续":"让两台电脑，共用复制粘贴";
         homeSubtitle.Text=paired?"文字、截图和文件，沿用你熟悉的快捷键":"先连接你的 Mac，之后就像在同一台电脑上操作";
-        string state=!paired?"等待连接 Mac":bridge.Paused?"同步已暂停":!online?"已配对，等待 Mac 上线":"两台电脑已连接";
+        string state=!paired?"尚未配对":bridge.Paused?"同步已暂停":!online?"未连接：等待 Mac":"已连接，请复制文字测试";
         railState.Text=state;homeState.Text=state;stateDot.Fill=paired&&online&&!bridge.Paused?Hex("#127C5D"):Hex("#8090A8");
         homeHint.Text=!paired?"第一次只需完成一次配对，点击下方开始":bridge.Paused?"点击恢复后，请重新复制需要的内容":!online?"请在 Mac 打开 CopyBridge，并确认两台电脑在同一网络":FriendlyStatus(bridge.Status);
         homeConnect.Content=paired?"查看连接":"连接我的 Mac";homePause.Content=bridge.Paused?"恢复同步":"暂停同步";homePause.Visibility=paired?Visibility.Visible:Visibility.Collapsed;
